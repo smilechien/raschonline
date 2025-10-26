@@ -5092,3 +5092,4 @@ tvalue=abs(round(tvalue,2))
            '06 07
       response.end
   end if '6
+  %>
