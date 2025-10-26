@@ -5105,7 +5105,7 @@ tvalue=abs(round(tvalue,2))
 
  %>
                <script type="text/javascript">
-			google_api_key = 'AIzaSyBPTqFXDLNP2Og71yuXWZtNcrDiRC-BPsc'; // Your project's Google Maps API key goes here (https://code.google.com/apis/console)
+			google_api_key = ''; // Your project's Google Maps API key goes here (https://code.google.com/apis/console)
 			language_code = '';
 			  document.write('<scr'+'ipt type="text/javascript" src="https://maps.googleapis.com/maps/api/js?v=3&amp;libraries=geometry&amp;language='+(self.language_code?self.language_code:'')+'&amp;key='+(self.google_api_key?self.google_api_key:'')+'"><'+'/scr'+'ipt>');
 		       // document.write('<scr'+'ipt type="text/javascript" src="https://maps.googleapis.com/maps/api/js?v=3&amp;libraries=geometry&amp;language='+(self.language_code?self.language_code:'')+'&amp;key='+(self.google_api_key?self.google_api_key:"></scr'+'ipt>');
@@ -7966,3 +7966,4 @@ mcolora(22)="#00FFFF"
 
 </body>
 </html>
+
