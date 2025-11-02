@@ -60,16 +60,14 @@ Click Run Rasch Model.
 View the generated statistics and plots.
 
 🧮 Example Dataset
-pgsql
-複製程式碼
+ 
 Item1 Item2 Item3 Item4 Item5 Item6 Item7 Item8 Item9 Item10 name group
 1 1 1 1 1 1 1 0 1 Student1 1
 1 1 1 1 1 1 1 1 0 Student2 1
 1 1 1 1 1 1 1 0 1 Student3 1
 0 1 1 1 1 1 1 0 1 Student4 0
 📁 File Structure
-bash
-複製程式碼
+ 
 RaschOnline/
 │
 ├── raschonline.asp        # Main ASP program
