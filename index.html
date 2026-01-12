@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rasch Online (Upload CSV)</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 22px; line-height: 1.35; }
+    .card { max-width: 920px; border: 1px solid #ddd; border-radius: 14px; padding: 18px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    pre { background: #f7f7f7; padding: 12px; border-radius: 12px; overflow: auto; }
+    .btn { padding: 10px 14px; border: 1px solid #222; border-radius: 12px; background: #fff; cursor: pointer; }
+    .btn:hover { transform: translateY(-1px); }
+    .muted { color: #555; }
+    .ok { color: #0a7; font-weight: 700; }
+    .err { color: #c00; font-weight: 700; }
+    a { text-decoration: none; }
+    .links a { margin-right: 12px; }
+  
+    /* UI tweak: make form inputs light blue for better visibility */
+    input[type="file"],
+    input[type="number"],
+    input[type="text"],
+    select {
+      background: #d7ecff;
+      border: 1px solid #7fb6e6;
+      border-radius: 10px;
+      padding: 8px 10px;
+      outline: none;
+    }
+    input[type="file"] { padding: 6px 10px; }
+    input:focus, select:focus {
+      box-shadow: 0 0 0 3px rgba(127, 182, 230, 0.35);
+    }
+
+  
+/* Floating contact button (bottom-right) */
+.contact-fab{
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 9999;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-radius: 999px;
+  border: 1px solid #1f2937;
+  background: #ffffff;
+  box-shadow: 0 10px 25px rgba(0,0,0,0.12);
+  cursor: pointer;
+  font-weight: 700;
+}
+.contact-fab:hover{ transform: translateY(-1px); }
+.contact-fab .icon{ font-size: 18px; line-height: 1; }
+
+.modal-backdrop{
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0,0,0,0.45);
+  z-index: 10000;
+  padding: 18px;
+}
+.modal{
+  width: min(980px, 96vw);
+  max-height: 88vh;
+  overflow: auto;
+  background: #fff;
+  border-radius: 16px;
+  padding: 16px 18px;
+  box-shadow: 0 20px 50px rgba(0,0,0,0.25);
+}
+.modal-close{
+  border: 1px solid #999;
+  background: #fff;
+  border-radius: 10px;
+  width: 36px;
+  height: 36px;
+  font-size: 22px;
+  cursor: pointer;
+}
+.modal-columns{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+  margin-top: 10px;
+}
+.modal-card{
+  border: 1px solid #e5e7eb;
+  border-radius: 14px;
+  padding: 12px;
+  background: #fafafa;
+}
+.email-list{ margin: 0; padding-left: 18px; }
+.cta-btn{
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid #111;
+  background: #fff;
+  font-weight: 800;
+}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Rasch Online (CSV upload, <font color=red>1st & last columns are ID and Profile labels:0,1)</font></h2>font></h2>
+    <p class="muted">
+      Upload a dichotomous (0/1) response matrix in CSV format. The first column must be <b>ID</b> (person label).
+      Remaining columns are items (e.g., 0/1/2). Missing values allowed (dot,empty or NA). If the LAST column is named Profile/profile and contains integers 0–6, it will be excluded as a cluster criterion.
+    </p>
+  <h2>Upload a response matrix in CSV format and generate a complete Rasch dashboard report (tables + figures) in one run.</h2>
+    <div class="row">
+      <button id="runDemo" class="btn" type="button" title="Run demo sample (no upload)">
+        <span style="display:inline-flex;align-items:center;gap:8px;">
+          <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M8 5v14l11-7z"></path>
+          </svg>
+          Run demo
+        </span>
+      </button>
+      <a class="btn" href="/demo.csv" download>Download demo sample CSV (kidscience.csv (0/1/2))</a>
+      <a class="btn" href="/health">Health check</a>
+    </div>
+
+    <h3>Expected CSV format</h3>
+    <pre>ID,Watch birds,Read books on animals,Read books on plants,Watch grass change,Find bottles and cans,Look up strange animal or plant,Watch animal move,Look in sidewalk cracks,Learn weed names,Listen to bird sing,Find where animal lives,Go to museum,Grow garden,Look at pictures of plants,Read animal stories,Make a map,Watch what animals eat,Go on picnic,Go to zoo,Watch bugs,Watch bird make nest,Find out what animals eat,Watch a rat,Find out what flowers live on,Talk w/friends about plants,Profile
+A01,1,2,1,1,1,0,2,0,1,2,2,2,2,0,2,1,1,2,2,0,2,1,0,2,0,1
+A02,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1
+A03,2,2,1,1,0,1,1,0,1,2,2,2,2,1,2,2,1,2,2,1,2,1,1,1,1,1
+A04,1,0,1,0,0,1,0,1,2,2,1,2,2,1,1,1,1,2,2,0,2,1,1,1,1,1
+A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
+
+    <h3>Run</h3>
+    <form id="frm" class="row" action="/run" method="post" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".csv" required />
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:220px;">
+        <span style="font-size:12px;opacity:.8;">Data mode</span>
+        <select name="mode">
+            <option value="auto" selected>Auto-detect (recommended)</option>
+            <option value="polytomous">Polytomous (rating scale)</option>
+            <option value="dichotomous">Dichotomous (0/1)</option>
+            <option value="continuous">Continuous (transform to rating scale)</option>
+          </select>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:220px;">
+        <span style="font-size:12px;opacity:.8;">Engine</span>
+        <select name="engine" id="engineSel">
+          <option value="python" selected>Python (fast, deployable)</option>
+          <option value="tam">TAM (R) reference engine</option>
+        </select>
+      </label>
+
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:220px;" id="tamModelWrap">
+        <span style="font-size:12px;opacity:.8;">TAM model</span>
+        <select name="tam_model">
+          <option value="RSM" selected>RSM</option>
+          <option value="PCM">PCM</option>
+        </select>
+      </label>
+
+        <label class="field">
+          <span class="label">Continuous transform</span>
+          <select name="continuous_transform">
+            <option value="linear" selected>Linear (min-max)</option>
+            <option value="log">Log (log1p then min-max)</option>
+            <option value="percent">Percent (0..1 → 0..100 then min-max)</option>
+          </select>
+        </label>
+
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:160px;">
+        <span style="font-size:12px;opacity:.8;">Max category (optional)</span>
+        <input name="max_category" type="number" min="1" step="1" placeholder="auto" />
+      
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:160px;">
+        <span style="font-size:12px;opacity:.8;">KID no. (focus person)</span>
+        <input name="kid_no" type="number" min="1" step="1" value="1" />
+      </label>
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:160px;">
+        <span style="font-size:12px;opacity:.8;">Item no. (focus item)</span>
+        <input name="item_no" type="number" min="1" step="1" value="1" />
+      </label>
+
+</label>
+      <button class="btn" type="submit">Run Rasch</button>
+    </form>
+
+    <p id="msg" class="muted"></p>
+    <div id="out" class="links"></div>
+
+    <hr />
+
+  <p class="muted">
+      Authors:
+      <br/>• Tsair-Wei Chien, Wen-Chung Wang</b>
+      <br/>• <a href="https://youtu.be/vvi27MqIxLs">MP4 video</a>
+    </p>
+
+
+    <p class="muted">
+      Notes:
+      <br/>• The report includes <b>Person(NON-EXTREME)</b> and <b>Item(NON-EXTREME)</b> summaries (like your ASP tail).
+      <br/>• “NON-EXTREME” excludes persons/items with raw score = 0 or raw score = max valid count.
+    </p>
+  
+    <hr />
+    <h3>ReadMe (Concise)</h3>
+<hr />
+<h3>ReadMe (3 steps to all-in-one report)</h3>
+<p class="muted" style="margin-top:8px;">
+  RaschOnline is designed for a <b>simple all-in-one workflow</b>. You do not need to select figures one-by-one.
+  Instead, the system generates a <b>single integrated HTML dashboard report</b> containing the core Rasch tables
+  and visualizations after one run.
+</p>
+
+<ol class="muted" style="margin-top:8px; padding-left: 20px;">
+  <li>
+    <b>Upload CSV</b><br/>
+    Prepare a CSV where the first column is <b>ID</b> (person label). Middle columns are item responses
+    (0/1 or 0/1/2; missing allowed as blank/NA/dot). If the last column is <b>Profile</b> (0–6), it will be treated as a grouping label.
+  </li>
+  <li>
+    <b>Run Rasch</b><br/>
+    Keep <b>Auto-detect</b> mode unless you know the data type. Optionally set:
+    <b>KID no.</b> to focus one person in KIDMAP, and <b>Item no.</b> to focus one item in ICC/CPC.
+    Then click <b>Run Rasch</b>.
+  </li>
+  <li>
+    <b>See Report (All-in-one Dashboard)</b><br/>
+    Open <b>Report (HTML)</b> to view the complete dashboard (tables + figures). You can also download
+    <b>Person estimates (CSV)</b>, <b>Item estimates (CSV)</b>, and the processed <b>Input (CSV)</b>.
+  </li>
+</ol>
+
+<p class="muted" style="margin-top:10px;">
+  <b>Try without data:</b> Click <b>Run demo</b> to generate a full dashboard instantly, or download the demo CSV and run it locally.
+</p>
+
+
+  </div>
+
+<script>
+  const frm = document.getElementById('frm');
+  const msg = document.getElementById('msg');
+  const out = document.getElementById('out');
+
+  frm.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    out.innerHTML = '';
+    msg.textContent = 'Running...';
+
+    const fd = new FormData(frm);
+    try {
+      const res = await fetch('/run', { method: 'POST', body: fd });
+      const data = await readJsonSafe(res);
+      if (!data.ok) {
+        msg.innerHTML = '<span class="err">Error:</span> ' + (data.error || 'Unknown error') + (data.log_url ? ` <a class="btn" href="${data.log_url}" target="_blank">Open log</a>` : '');
+        return;
+      }
+      msg.innerHTML = '<span class="ok">Done.</span> Open the report or download outputs:';
+      const links = [
+        ['Report (HTML)', data.report_url],
+        ['Person estimates (CSV)', data.person_csv_url],
+        ['Item estimates (CSV)', data.item_csv_url],
+        ['Input (CSV)', data.input_csv_url]
+      ];
+      out.innerHTML = links.map(([t,u]) => `<a href="${u}" target="_blank" class="btn">${t}</a>`).join(' ');
+    } catch (err) {
+      msg.innerHTML = '<span class="err">Error:</span> ' + err;
+    }
+  });
+
+  const runDemoBtn = document.getElementById('runDemo');
+  if (runDemoBtn) {
+    runDemoBtn.addEventListener('click', async () => {
+      out.innerHTML = '';
+      msg.textContent = 'Running demo...';
+      try {
+        const res = await fetch('/run_demo', { method: 'POST' });
+        const data = await readJsonSafe(res);
+        if (!data.ok) {
+          msg.innerHTML = '<span class="err">Error:</span> ' + (data.error || 'Unknown error') + (data.log_url ? ` <a class="btn" href="${data.log_url}" target="_blank">Open log</a>` : '');
+          return;
+        }
+        msg.innerHTML = '<span class="ok">Done (demo).</span> Open the report or download outputs:';
+        const links = [
+          ['Report (HTML)', data.report_url],
+          ['Person estimates (CSV)', data.person_csv_url],
+          ['Item estimates (CSV)', data.item_csv_url],
+          ['Input (CSV)', data.input_csv_url]
+        ];
+        out.innerHTML = links.map(([t,u]) => `<a href="${u}" target="_blank" class="btn">${t}</a>`).join(' ');
+      } catch (err) {
+        msg.innerHTML = '<span class="err">Error:</span> ' + err;
+      }
+    });
+  }
+
+
+  async function readJsonSafe(res) {
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('application/json')) return await res.json();
+    const txt = await res.text();
+    return { ok: false, error: txt || ('Non-JSON response (status ' + res.status + ')') };
+  }
+
+  // Toggle TAM options
+  const engineSel = document.getElementById('engineSel');
+  const tamWrap = document.getElementById('tamModelWrap');
+  function syncEngineUI(){
+    const isTam = (engineSel && engineSel.value === 'tam');
+    if (tamWrap) tamWrap.style.display = isTam ? 'flex' : 'none';
+  }
+  if (engineSel){
+    engineSel.addEventListener('change', syncEngineUI);
+    syncEngineUI();
+  }
+</script>
+<!-- ========== Floating contact button + modal ========== -->
+<button
+  type="button"
+  class="contact-fab"
+  onclick="openContactModal()"
+  title="Contact authors / Request CMC"
+>
+  <span class="icon">💬</span>
+  Contact authors / Request CMC
+</button>
+
+<div id="contact-modal" class="modal-backdrop" aria-hidden="true">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="contact-title">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+      <h2 id="contact-title">Contact authors / Request CMC</h2>
+      <button
+        type="button"
+        class="modal-close"
+        onclick="closeContactModal()"
+        aria-label="Close"
+      >
+        ×
+      </button>
+    </div>
+
+    <p>Please choose one of the following ways to contact the authors.</p>
+
+    <div class="modal-columns">
+      <div class="modal-card">
+        <h3>1. LINE account</h3>
+        <p>LINE Official Account ID:</p>
+        <p><code>@onq5657t</code></p>
+
+        <a
+          class="line-qr"
+          href="https://line.me/R/ti/p/%40onq5657t"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          <img
+            src="https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=https%3A%2F%2Fline.me%2FR%2Fti%2Fp%2F%2540onq5657t"
+            alt="LINE QR code for @onq5657t"
+          />
+        </a>
+
+        <p class="muted">
+          In LINE, choose “Add friends → QR code” and scan this image,
+          or tap the QR code to open the LINE add-friend page.
+        </p>
+      </div>
+
+      <div class="modal-card">
+        <h3>2. Email</h3>
+        <p>You can send an email to either of the following addresses:</p>
+        <ul class="email-list">
+          <li><code>rasch.smile@gmail.com</code></li>
+          <li><code>codingpaperabc@gmail.com</code></li>
+        </ul>
+        <p class="muted">
+          Copy and paste the address into your preferred email client or
+          webmail service.
+        </p>
+      </div>
+
+      <div class="modal-card">
+        <h3>3. Join the ChatGPT group chatroom</h3>
+        <p>
+          We host a shared ChatGPT room where you can discuss TAAA / Basket /
+          FLCA results together with the authors.
+        </p>
+        <ol class="muted">
+          <li>
+            Copy this email address:
+            <br><code>rasch.smile@gmail.com</code>
+          </li>
+          <li>
+            Send an email with the subject:
+            <br><code>[Join TAAA FLCA ChatGPT Room]</code>
+          </li>
+          <li>
+            You will receive a reply containing the ChatGPT group-chat link.
+          </li>
+        </ol>
+        <p class="muted">
+          Open the invite link in your browser and sign in with your ChatGPT
+          account to enter the group chatroom.
+        </p>
+      </div>
+
+      <div class="modal-card">
+        <p class="muted">
+          The authors personally cover the Google App Engine usage fees
+          required to keep this app online. If this tool is helpful for your
+          bibliometrics or research work, voluntary donations are appreciated
+          to support ongoing maintenance and further development.
+        </p>
+        <a class="cta-btn"
+           href="https://payment.ecpay.com.tw/QuickCollect/PayData?D50jzB3Lqk68BhoyYtTffB90EJpM0b4XmYFUwS4pAMI%3d"
+           target="_blank" rel="noopener noreferrer">
+          🚀 Donate
+        </a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  function openContactModal() {
+    const modal = document.getElementById("contact-modal");
+    if (!modal) return;
+    modal.style.display = "flex";
+    document.body.style.overflow = "hidden";
+    modal.setAttribute("aria-hidden", "false");
+  }
+
+  function closeContactModal() {
+    const modal = document.getElementById("contact-modal");
+    if (!modal) return;
+    modal.style.display = "none";
+    document.body.style.overflow = "";
+    modal.setAttribute("aria-hidden", "true");
+  }
+
+  document.addEventListener("click", function (evt) {
+    const modal = document.getElementById("contact-modal");
+    if (!modal) return;
+    if (evt.target === modal) closeContactModal();
+  });
+
+  document.addEventListener("keydown", function (evt) {
+    if (evt.key === "Escape") closeContactModal();
+  });
+
+  window.openContactModal  = openContactModal;
+  window.closeContactModal = closeContactModal;
+</script>
+</body>
+</html>
