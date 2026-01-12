@@ -1,0 +1,21 @@
+# .gcloudignore
+# Ignore everything by default
+**
+
+# Always include the ignore file itself
+!.gcloudignore
+
+# Include App Engine config + entrypoint + dependencies
+!app.yaml
+!main.py
+!requirements.txt
+!raschonline.py
+
+# Include static assets (must unignore directory first, then contents)
+!static/
+!static/**
+
+!static/**
+ 
+
+ 
