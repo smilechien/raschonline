@@ -66,7 +66,111 @@ import webbrowser
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-from flask import Flask, request, jsonify, send_from_directory, abort
+from flask import Flask, request, jsonify, send_from_directory, abort, redirect
+
+# ---------------------------------------------------------------------
+# URL query runner (GAE-friendly)
+#   /?example=1                    -> run bundled demo.csv
+#   /?url=https://.../file.csv      -> fetch CSV and run
+# Security:
+#   - allowlist (env URL_FETCH_ALLOWLIST, comma-separated hostnames)
+#   - max size (env URL_FETCH_MAX_BYTES, default 10MB)
+#   - timeout (env URL_FETCH_TIMEOUT, default 12s)
+#   - block localhost/private/link-local/reserved IPs & metadata hosts
+# ---------------------------------------------------------------------
+import urllib.parse
+import urllib.request
+import socket
+import ipaddress
+
+def _parse_allowlist(default_host: str) -> set[str]:
+    raw = (os.environ.get("URL_FETCH_ALLOWLIST") or "").strip()
+    if raw:
+        items = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    else:
+        # sensible defaults; always allow current host so ?url can point to /demo.csv
+        items = [default_host.lower(), "raw.githubusercontent.com", "githubusercontent.com", "storage.googleapis.com"]
+    return set(items)
+
+
+def _host_allowed(host: str, allow: set[str]) -> bool:
+    h = (host or "").lower().strip(".")
+    if not h:
+        return False
+    # exact match or subdomain of an allowlisted domain
+    return any(h == a or h.endswith("." + a) for a in allow)
+
+
+def _resolve_public_ips(host: str) -> list[str]:
+    """Resolve host -> IPs; raise if any resolved IP is non-public."""
+    bad_hosts = {"metadata.google.internal", "metadata"}
+    if host.lower() in bad_hosts:
+        raise ValueError("Blocked metadata host")
+
+    ips: list[str] = []
+    for family, _, _, _, sockaddr in socket.getaddrinfo(host, None):
+        ip = sockaddr[0]
+        ips.append(ip)
+        ip_obj = ipaddress.ip_address(ip)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+        ):
+            raise ValueError(f"Blocked non-public IP: {ip}")
+        # Explicitly block common metadata IP
+        if str(ip_obj) == "169.254.169.254":
+            raise ValueError("Blocked metadata IP")
+    # If resolution returns nothing, treat as blocked
+    if not ips:
+        raise ValueError("Host resolution failed")
+    return ips
+
+
+def _fetch_url_to_tmp(url: str, run_id: str, default_host: str) -> Path:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http/https URLs are allowed")
+    if not parsed.netloc:
+        raise ValueError("URL must include a hostname")
+
+    host = parsed.hostname or ""
+    allow = _parse_allowlist(default_host)
+    if not _host_allowed(host, allow):
+        raise ValueError(f"Host not in allowlist: {host}")
+
+    # SSRF guard: resolve and ensure public IPs
+    _resolve_public_ips(host)
+
+    max_bytes = int(os.environ.get("URL_FETCH_MAX_BYTES", str(10 * 1024 * 1024)))
+    timeout = float(os.environ.get("URL_FETCH_TIMEOUT", "12"))
+
+    req = urllib.request.Request(url, headers={"User-Agent": "RaschOnline/1.0"})
+    out_path = (REPORTS_DIR / run_id / "url.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    total = 0
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        # allow text/csv or text/plain; don't hard-fail if missing
+        if ct and ("text" not in ct and "csv" not in ct and "octet-stream" not in ct):
+            # still allow; many servers mislabel CSV
+            pass
+        with open(out_path, "wb") as f:
+            while True:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"File too large (>{max_bytes} bytes)")
+                f.write(chunk)
+
+    if total == 0:
+        raise ValueError("Downloaded file was empty")
+    return out_path
 
 # ---------------------------------------------------------------------
 # Paths
@@ -131,6 +235,50 @@ def _new_run_id() -> str:
 # ---------------------------------------------------------------------
 @app.get("/")
 def home():
+    # -------------------------------------------------------------
+    # Workflow-friendly query parameters
+    #   /?example=1
+    #   /?url=https://.../data.csv
+    # Optional extra params (passed into engine): mode, max_category,
+    # continuous_transform, kid_no, item_no, ...
+    # -------------------------------------------------------------
+    try:
+        example = (request.args.get("example") or "").strip()
+        url = (request.args.get("url") or "").strip()
+
+        if example == "1" or url:
+            run_id = _new_run_id()
+            # allowlist defaults include current host
+            default_host = (request.host.split(":", 1)[0] if request.host else "").strip()
+
+            if example == "1":
+                demo = STATIC_DIR / "demo.csv"
+                if not demo.exists():
+                    return "Missing static/demo.csv", 404
+                csv_path = demo
+            else:
+                csv_path = _fetch_url_to_tmp(url, run_id=run_id, default_host=default_host)
+
+            # Pass other query params into the engine (but not url/example)
+            form = {k: v for k, v in request.args.items() if k not in ("url", "example")}
+            payload = _run_engine(Path(csv_path), run_id, form)
+            rep = payload.get("report_url") or payload.get("report_html_url")
+            if rep:
+                return redirect(rep)
+            return jsonify(_json_sanitize(payload))
+
+    except Exception as e:
+        # Return a readable message instead of a blank 500 page.
+        return (
+            jsonify({
+                "ok": False,
+                "error": repr(e),
+                "traceback": traceback.format_exc(),
+            }),
+            500,
+        )
+
+    # Default: serve the UI
     idx = STATIC_DIR / "index.html"
     if not idx.exists():
         return "Missing static/index.html", 404

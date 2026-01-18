@@ -23,6 +23,15 @@ This file is self-contained and does not depend on scipy.
 
 from __future__ import annotations
 
+# --- Consistent color palette (used for clusters/categories across the HTML report) ---
+# Keep this list stable so colors remain consistent across figures.
+SPECIFIED_COLORS = [
+    "#FF0000", "#0000FF", "#998000", "#008000", "#800080",
+    "#FFC0CB", "#000000", "#ADD8E6", "#FF4500", "#A52A2A",
+    "#8B4513", "#FF8C00", "#32CD32", "#4682B4", "#9400D3",
+    "#FFD700", "#C0C0C0", "#DC143C", "#1E90FF",
+]
+
 def _safe_add_fig(html_parts, fig, title: str, note: str | None = None):
     """Append a Plotly figure to html_parts safely."""
     try:
@@ -85,6 +94,55 @@ def _safe_add_table(html_parts, df, title: str, note: str | None = None, max_row
     except Exception as e:
         html_parts.append(f"<h3>{title}</h3><pre style='color:#b00'>Table render failed: {e}</pre>")
 
+
+
+# --- PTMA helper (Adjusted point-measure correlation; leave-one-out proxy) ---
+def compute_ptma_from_matrices(X_obs, theta, item_names=None, min_n: int = 5):
+    """Compute PTMA = cor(item score, theta excluding the item).
+
+    This is an efficient proxy: theta_minus_j is approximated by removing the item's
+    contribution from each person's total score, then correlating with item response.
+    It is intended for diagnostics (hover text / Table 11.2), not for estimation.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    X = _np.asarray(X_obs, dtype=float)
+    if X.ndim != 2:
+        return _pd.DataFrame({"ITEM": [], "PTMA": [], "N_USED": []})
+
+    P, I = X.shape
+    th = _np.asarray(theta, dtype=float)
+    if th.ndim != 1 or th.shape[0] != P:
+        # try transpose alignment
+        if th.ndim == 1 and th.shape[0] == I and X.shape[1] == th.shape[0]:
+            pass
+        return _pd.DataFrame({"ITEM": [], "PTMA": [], "N_USED": []})
+
+    if item_names is None:
+        item_names = [f"Item{j+1}" for j in range(I)]
+
+    # use raw total score as monotone proxy to theta; then subtract item j
+    # (works even if theta was not leave-one-out)
+    raw = _np.nansum(X, axis=1)
+
+    rows = []
+    for j in range(I):
+        y = X[:, j]
+        ok = _np.isfinite(y) & _np.isfinite(raw)
+        if ok.sum() < min_n:
+            rows.append([str(item_names[j]), _np.nan, int(ok.sum())])
+            continue
+        raw_mj = raw[ok] - y[ok]
+        # correlate y with raw_mj and with theta; take the safer (higher absolute) proxy
+        # use raw_mj as leave-one-out proxy for theta ordering
+        try:
+            ptma = float(_np.corrcoef(y[ok], raw_mj)[0, 1])
+        except Exception:
+            ptma = _np.nan
+        rows.append([str(item_names[j]), ptma, int(ok.sum())])
+
+    return _pd.DataFrame(rows, columns=["ITEM", "PTMA", "N_USED"])
 def _add_hlines(fig, ys, dash="dot"):
     try:
         if ys is None:
@@ -361,6 +419,125 @@ def _build_vertices_relations_from_residuals(res, idf, top_k_edges: int = 80):
     return vtx, rel
 
 
+
+def _simulate_rasch_matrix_from_res(res, seed: int = 12345):
+    """Simulate a new response matrix under the fitted Rasch model.
+
+    - Preserves the original missingness pattern (NaN cells remain NaN).
+    - Dichotomous: categories {0,1}.
+    - Polytomous (RSM): categories {0..K-1} with global tau.
+
+    Returns
+    -------
+    Xsim : ndarray (P,I) in internal 0..K-1 coding (NaN for missing)
+    """
+    rng = np.random.default_rng(int(seed) if seed is not None else 12345)
+
+    dbg = getattr(res, "debug", {}) if hasattr(res, "debug") else {}
+    X0 = None
+    if isinstance(dbg, dict):
+        for k in ("X", "X_mapped", "data"):
+            if k in dbg:
+                try:
+                    X0 = np.asarray(dbg[k], dtype=float)
+                    break
+                except Exception:
+                    X0 = None
+    if X0 is None:
+        try:
+            X0 = np.asarray(getattr(res, "data", None), dtype=float)
+        except Exception:
+            X0 = None
+    if X0 is None or getattr(X0, "ndim", 0) != 2:
+        raise ValueError("Cannot simulate: original response matrix not found.")
+
+    theta = np.asarray(getattr(res, "theta", None), dtype=float)
+
+    # PATCH: accept res.b as beta (your code uses res.b elsewhere)
+    _b = getattr(res, "b", None)
+    beta = np.asarray(_b if _b is not None else getattr(res, "beta", None), dtype=float)
+
+    # PATCH: tau is only required for polytomous; for dichotomous allow missing tau
+    tau_raw = getattr(res, "tau", None)
+    tau = None if tau_raw is None else np.asarray(tau_raw, dtype=float)
+
+    if theta.ndim != 1 or beta.ndim != 1:
+        raise ValueError("Cannot simulate: theta/beta missing.")
+
+    # dichotomous: no tau needed (use a 2-length placeholder so downstream K logic stays consistent)
+    if (tau is None or getattr(tau, "ndim", 0) != 1) and int(getattr(res, "max_cat", 1)) <= 1:
+        tau = np.asarray([0.0, 0.0], dtype=float)
+
+    # polytomous: tau required
+    if tau is None or getattr(tau, "ndim", 0) != 1:
+        raise ValueError("Cannot simulate: tau missing (polytomous).")
+
+    P, I = X0.shape
+    if theta.size != P or beta.size != I:
+        raise ValueError("Cannot simulate: shape mismatch in theta/beta vs X.")
+
+    K = int(tau.size)
+    min_cat = int(getattr(res, "min_cat", 0))
+    max_cat = int(getattr(res, "max_cat", K - 1))
+
+    miss = ~np.isfinite(X0)
+    Xsim = np.full((P, I), np.nan, dtype=float)
+
+    # Detect dichotomous
+    if K <= 2 and min_cat == 0 and max_cat == 1:
+        base = theta[:, None] - beta[None, :]
+        p1 = 1.0 / (1.0 + np.exp(-base))  # P(X=1)
+        U = rng.random((P, I))
+        Xsim = (U < p1).astype(float)
+        Xsim[miss] = np.nan
+        return Xsim
+
+    # Polytomous RSM sampling
+    Pmat = _rsm_prob(theta, beta, tau)  # (P,I,K)
+    cdf = np.cumsum(Pmat, axis=2)
+    U = rng.random((P, I, 1))
+    draw = (U <= cdf).argmax(axis=2).astype(float)  # 0..K-1
+    draw[miss] = np.nan
+    return draw
+
+
+def _zstd_from_x_and_model(res, X_obs: np.ndarray):
+    """Compute standardized residuals ZSTD for a given response matrix under fitted model."""
+    X = np.asarray(X_obs, dtype=float)
+    if X.ndim != 2:
+        raise ValueError("X must be 2D")
+
+    theta = np.asarray(getattr(res, "theta", None), dtype=float)
+
+    # PATCH: accept res.b as beta
+    _b = getattr(res, "b", None)
+    beta = np.asarray(_b if _b is not None else getattr(res, "beta", None), dtype=float)
+
+    # PATCH: tau optional for dichotomous
+    tau_raw = getattr(res, "tau", None)
+    tau = None if tau_raw is None else np.asarray(tau_raw, dtype=float)
+
+    if theta.ndim != 1 or beta.ndim != 1:
+        raise ValueError("theta/beta missing")
+
+    if (tau is None or getattr(tau, "ndim", 0) != 1) and int(getattr(res, "max_cat", 1)) <= 1:
+        tau = np.asarray([0.0, 0.0], dtype=float)
+
+    if tau is None or getattr(tau, "ndim", 0) != 1:
+        raise ValueError("tau missing (polytomous)")
+
+    K = int(tau.size)
+    Pmat = _rsm_prob(theta, beta, tau)  # (P,I,K)
+    cats = np.arange(K, dtype=float)[None, None, :]
+    exp = np.sum(Pmat * cats, axis=2)
+    exp2 = np.sum(Pmat * (cats ** 2), axis=2)
+    var = np.maximum(exp2 - exp ** 2, 1e-9)
+    resid = X - exp
+    z = resid / np.sqrt(var)
+    z[~np.isfinite(X)] = np.nan
+    return z
+
+
 def kano_plot_aligned(
     nodes: pd.DataFrame,
     edges: pd.DataFrame | None = None,
@@ -373,6 +550,8 @@ def kano_plot_aligned(
     y_label: str | None = None,
     aac_x: float | None = None,
     aac_y: float | None = None,
+    beta_value: float | None = None,
+    beta_p: float | None = None,
 ) -> "object":
     """Kano-type plot (Dimension–Kano Map with Zscore residuals) with optional edges."""
     try:
@@ -493,6 +672,15 @@ def kano_plot_aligned(
     cluster_color_map = make_cluster_colors(df["cluster"])
     df["color"]=df["cluster"].map(lambda c: cluster_color_map.get(int(c), "#7f7f7f"))
 
+    # Mark suspected testlet items with thicker outlines (requires boolean column 'is_testlet')
+    try:
+        if 'is_testlet' in df.columns:
+            df['outline_w'] = df['is_testlet'].apply(lambda v: 3.0 if bool(v) else 1.0)
+        else:
+            df['outline_w'] = 1.0
+    except Exception:
+        df['outline_w'] = 1.0
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=lower_x,y=lower_y,mode="lines",line=dict(color="blue",width=2.5),hoverinfo="skip",name="Lower Kano curve"))
     fig.add_trace(go.Scatter(x=upper_x,y=upper_y,mode="lines",line=dict(color="blue",width=2.5),hoverinfo="skip",name="Upper Kano curve"))
@@ -577,23 +765,31 @@ def kano_plot_aligned(
             bi = _getf(row, "b_i") or _getf(row, "b(i)")
             parts = [
                 f"{row['name']}",
+                ("⚠ Suspected testlet" if str(row.get('is_testlet', '')).lower() in ('1','true','t','yes') else None),
                 f"Cluster: {int(row['cluster'])}",
                 f"{x_col}={float(row['x_val']):.3f}",
                 f"{y_col}={float(row['y_val']):.3f}",
             ]
+            parts = [p for p in parts if p]
             if ss is not None:
                 parts.append(f"SS(i)={ss:.3f}")
             if ai is not None:
                 parts.append(f"a(i)={ai:.3f}")
             if bi is not None:
                 parts.append(f"b(i)={bi:.3f}")
+            ptma = _getf(row, 'PTMA') or _getf(row, 'ptma')
+            q3m = _getf(row, 'Q3MAX') or _getf(row, 'q3max')
+            if ptma is not None:
+                parts.append(f"PTMA={ptma:.3f}")
+            if q3m is not None:
+                parts.append(f"Q3max={q3m:.3f}")
             hover.append("<br>".join(parts))
 
         fig.add_trace(go.Scatter(
             x=sub["x_val"], y=sub["y_val"], mode="markers",
             marker=dict(
                 size=sub["bubble_size"], color=sub["color"],
-                line=dict(width=1, color="rgba(0,0,0,0.35)"),
+                line=dict(width=sub.get('outline_w', 1.0), color="rgba(0,0,0,0.55)"),
                 sizemode="diameter",
             ),
             name=f"Cluster {int(c)}",
@@ -609,7 +805,25 @@ def kano_plot_aligned(
     fig.update_layout(title=title,
                       xaxis_title=x_label,yaxis_title=y_label,
                       width=980,height=700,hovermode="closest",
-                      legend_title="Cluster",margin=dict(l=60,r=20,t=80,b=60))
+                      legend_title="Cluster",margin=dict(l=60,r=20,t=80,b=60))    # Big beta callout (requested): show the regression/path coefficient between 2 clusters
+    try:
+        if beta_value is not None and np.isfinite(float(beta_value)):
+            _btxt = f"<b>Beta={float(beta_value):.2f}</b>"
+            try:
+                if beta_p is not None and np.isfinite(float(beta_p)):
+                    _btxt += f"<br><span style='font-size:20px'>(p={float(beta_p):.3g})</span>"
+            except Exception:
+                pass
+            fig.add_annotation(
+                xref="paper", yref="paper",
+                x=0.02, y=0.98,
+                text=_btxt,
+                showarrow=False,
+                font=dict(size=30, color="#b00"),
+                align="left",
+            )
+    except Exception:
+        pass
     fig.update_xaxes(range=[x_low,x_high])
     fig.update_yaxes(range=[y_low,y_high])
     return fig
@@ -980,8 +1194,9 @@ def run_rasch(
     csv_path: str,
     id_col: Optional[str] = None,
     drop_cols: Sequence[str] = (),
-    tau_fixed: Optional[Sequence[float]] = (-0.86, 0.86),
-    estimate_tau: bool = False,
+    tau_fixed: Optional[Sequence[float]] = None,
+    estimate_tau: bool = True,
+    damping_tau: float = 1.0,
     max_iter: int = 100,
     tol: float = 1e-5,
     damping: float = 0.3,
@@ -1061,6 +1276,8 @@ def run_rasch(
     # Coerce to numeric (non-numeric -> NaN)
     X = use_df[item_cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
 
+    X_raw = X.copy()
+
     # --- Compatibility: continuous_transform default in UI ---
     # Some UIs pass continuous_transform='linear' by default; interpret as NO transform.
     if continuous_transform is not None:
@@ -1082,10 +1299,9 @@ def run_rasch(
         _is_continuous = False
 
     if _is_continuous and continuous_transform is None:
-        # If UI forgot to pass a transform, default to min-max to 0..1 then bin to max_category (default 2).
+        # Auto: any decimals/negative/>10 -> linearly map into 0..4 Likert categories before Rasch.
         continuous_transform = "minmax"
-        if max_category is None:
-            max_category = 2
+        max_category = 4
 # Auto-detect continuous data:
     # Rule: if any finite cell has decimals OR is negative OR > 10, treat as continuous.
     try:
@@ -1097,8 +1313,9 @@ def run_rasch(
             else:
                 _is_cont = not np.all(np.isclose(_xf, np.round(_xf)))
         if _is_cont and (continuous_transform is None):
-            # If user didn't choose, default to minmax_0_1 (safe for most continuous scales)
-            continuous_transform = 'minmax_0_1'
+            # Auto: any decimals/negative/>10 -> linearly map into 0..4 Likert categories before Rasch.
+            continuous_transform = 'minmax'
+            max_category = 4
     except Exception:
         pass
 
@@ -1121,7 +1338,7 @@ def run_rasch(
                 else:
                     X2[:, j] = (col - vmin) / (vmax - vmin)
             # map 0..1 to integer categories 0..max_category (default 2)
-            Kt = int(max_category) if max_category is not None else 2
+            Kt = int(max_category) if max_category is not None else 4
             X = np.rint(X2 * Kt)
         else:
             raise ValueError(f"Unsupported continuous_transform: {continuous_transform}")
@@ -1143,6 +1360,25 @@ def run_rasch(
         'profile': profile_labels,
 }
         debug["X"] = X.tolist()
+        # Keep both raw and transformed matrices for diagnostics.
+        # IMPORTANT: All post-analysis (DIF/Q3/Kano/TCP/etc.) should use the transformed categorical matrix
+        # when the input was continuous.
+        try:
+            debug["X_raw"] = X_raw.tolist()
+        except Exception:
+            pass
+        try:
+            debug["X_transformed"] = X.tolist()
+            debug["X_post"] = X.tolist()
+        except Exception:
+            pass
+        try:
+            debug["is_continuous_input"] = bool(_is_continuous)
+            debug["continuous_transform"] = continuous_transform
+            debug["max_category"] = max_category
+        except Exception:
+            pass
+
         debug["item_cols"] = list(map(str, item_cols))
     except Exception:
         pass
@@ -1170,7 +1406,22 @@ def run_rasch(
             tau = np.zeros(K, dtype=float)
             tau[1:] = tf
         else:
-            raise ValueError(f"tau_fixed must have length K-1={K-1} (or K={K}), but got {tf.size}")
+            # If user provided tau_fixed but its length does not match the detected number of categories,
+            # treat it as *starting values* and expand/shrink safely instead of failing.
+            # Common case: legacy 3-category defaults (len=2) with K>3 (e.g., continuous -> 0..4 gives K=5).
+            import numpy as _np
+            if tf.size >= 2 and K > 2:
+                # Use endpoints and linearly interpolate to K-1 steps, then center (mean=0).
+                x_old = _np.linspace(0.0, 1.0, num=int(tf.size))
+                x_new = _np.linspace(0.0, 1.0, num=int(K-1))
+                tf_new = _np.interp(x_new, x_old, tf.astype(float))
+                tf_new = tf_new - _np.mean(tf_new)
+                tau = _np.zeros(K, dtype=float)
+                tau[1:] = tf_new
+            else:
+                # Fall back to zero steps
+                tau = _np.zeros(K, dtype=float)
+
     else:
         tau = np.zeros(K, dtype=float)
 
@@ -1221,14 +1472,39 @@ def run_rasch(
                 theta_new, V_p, r_p, max_raw=max_raw_p, clamp=clamp, adj_rate=adj_rate
             )
 
-            # (Optional) tau estimation — keep OFF for now (your old code blew up here)
-            if estimate_tau:
-                # very conservative, damped update in a safe range
-                # This is a placeholder; for exact ASP/Winsteps tau update, port the ASP step solver.
+            # (Optional) tau estimation (ASP-verified ratio update on category counts)
+            tau_old = tau.copy()
+            if estimate_tau and K > 2:
+                # Observed category counts (skip missing)
+                catobs = np.array([(X0 == k)[mask].sum() for k in range(K)], dtype=float)
+                # Expected category counts from current probabilities (skip missing)
+                catexp = np.array([np.sum(Pmat[:, :, k] * mask) for k in range(K)], dtype=float)
+
+                # ASP-style step threshold update using adjacent-category log-odds ratios
+                catthresh = tau.copy()
+                for k in range(1, K):
+                    if catobs[k] > 0 and catobs[k-1] > 0 and catexp[k] > 0 and catexp[k-1] > 0:
+                        catthresh[k] = tau[k] + np.log(catobs[k-1] / catobs[k]) - np.log(catexp[k-1] / catexp[k])
+                    else:
+                        # Guard: keep current value if counts are degenerate
+                        catthresh[k] = tau[k]
+
+                # Center steps (identification): mean(tau[1:]) = 0
+                if (K - 1) > 0:
+                    avg = float(np.mean(catthresh[1:]))
+                else:
+                    avg = 0.0
+                catthresh[0] = 0.0
+                catthresh[1:] = catthresh[1:] - avg
+
+                # Damped apply
+                damp = float(np.clip(damping_tau, 0.0, 1.0))
+                tau = (1.0 - damp) * tau + damp * catthresh
+                # keep in safe range
                 tau = np.clip(tau, -6.0, 6.0)
 
-            # convergence check
-            last_err = float(np.max(np.abs(np.concatenate([theta_new - theta, b_new - b]))))
+            # convergence check (include tau change)
+            last_err = float(np.max(np.abs(np.concatenate([theta_new - theta, b_new - b, tau - tau_old]))))
             theta, b = theta_new, b_new
 
             if not np.isfinite(last_err):
@@ -1353,6 +1629,66 @@ def run_rasch(
         "max_raw_item": int(max_raw_i),
         "item_cols": list(map(str, item_cols)),
     }
+
+    # ---- Testlet handling (A: diagnostics only; B: estimate testlet effects; dichotomous only) ----
+    try:
+        testlet_mode = str(kwargs.get('testlet_mode', 'diag')).strip().lower()
+    except Exception:
+        testlet_mode = 'diag'
+    if testlet_mode not in ('diag','estimate'):
+        testlet_mode = 'diag'
+    try:
+        q3_cut = float(kwargs.get('q3_cut', 0.20))
+    except Exception:
+        q3_cut = 0.20
+    try:
+        testlet_max_iter = int(kwargs.get('testlet_max_iter', 25))
+    except Exception:
+        testlet_max_iter = 25
+    try:
+        testlet_damp = float(kwargs.get('testlet_damp', 0.5))
+    except Exception:
+        testlet_damp = 0.5
+
+    debug['testlet_mode'] = testlet_mode
+    debug['q3_cut'] = float(q3_cut)
+
+    # Compute residual Q3 (items) from standardized residuals
+    try:
+        _Zm = std_resid.astype(float)
+        _Q3 = _np.corrcoef(_Zm, rowvar=False)
+        _np.fill_diagonal(_Q3, 0.0)
+        memb_i, edges = _detect_testlets_from_Q3(_Q3, item_cols, q3_cut=q3_cut)
+        debug['testlet_membership'] = {str(item_cols[i]): int(memb_i.get(i, 0)) for i in range(len(item_cols))}
+        debug['testlet_edges'] = [(str(item_cols[a]), str(item_cols[b]), float(w)) for a,b,w in edges]
+        debug['testlet_n_edges'] = int(len(edges))
+        debug['testlet_n_groups'] = int(max(memb_i.values()) if memb_i else 0)
+
+        # Mode B: estimate testlet effects via a simple JML refit (dichotomous only)
+        debug['testlet_estimated'] = False
+        if testlet_mode == 'estimate':
+            if int(K) == 2 and debug['testlet_n_groups'] >= 1:
+                th2, b2, tau_pk = _jml_testlet_refit_dicho(
+                    X0, theta, b, memb_i,
+                    max_iter=testlet_max_iter,
+                    damp=testlet_damp
+                )
+                # Keep original Rasch estimates, but add testlet-adjusted columns for comparison
+                person_df['MEASURE_TESTLET'] = th2
+                item_df['MEASURE_TESTLET'] = b2
+                debug['tau_testlet'] = tau_pk.tolist()
+                debug['theta_testlet'] = th2.tolist()
+                debug['b_testlet'] = b2.tolist()
+                debug['testlet_estimated'] = True
+            else:
+                debug['testlet_estimated'] = False
+                if int(K) != 2:
+                    debug['testlet_estimate_reason'] = 'Estimate mode supports dichotomous (0/1) only; fell back to diagnostics.'
+                else:
+                    debug['testlet_estimate_reason'] = 'No testlet groups detected at the chosen Q3 threshold; fell back to diagnostics.'
+    except Exception as _e:
+        debug['testlet_error'] = repr(_e)
+
     # Add matrices for exports / scree plots
     try:
         # Backward-compatible key expected by the report renderer
@@ -1388,6 +1724,124 @@ iterations=int(iterations),
     )
 
 
+def _detect_testlets_from_Q3(Q3, item_cols, q3_cut=0.20):
+    """Return (membership_dict, edges) from an item-item Q3 matrix.
+
+    - membership_dict maps item-index -> testlet_id (0=singleton/no testlet)
+    - edges is a list of (i,j,Q3_ij) for |Q3_ij|>=cut and i<j
+
+    Note: This uses connected components on the threshold graph as a fast, dependency-free
+    community proxy. Your report already provides a richer TCP; this function is only
+    used to gate testlet estimation in mode (B).
+    """
+    import numpy as np
+    Q3 = np.asarray(Q3, dtype=float)
+    I = Q3.shape[0]
+    cut = float(q3_cut)
+
+    idx = np.argwhere(np.abs(Q3) >= cut)
+    edges = []
+    for a, b in idx:
+        a = int(a); b = int(b)
+        if a < b:
+            edges.append((a, b, float(Q3[a, b])))
+
+    if not edges:
+        return {i: 0 for i in range(I)}, []
+
+    adj = {i: set() for i in range(I)}
+    for a, b, _w in edges:
+        adj[a].add(b); adj[b].add(a)
+
+    seen = set()
+    comp_id = 0
+    memb = {i: 0 for i in range(I)}
+    for i in range(I):
+        if i in seen:
+            continue
+        stack = [i]
+        comp = []
+        seen.add(i)
+        while stack:
+            u = stack.pop()
+            comp.append(u)
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v)
+                    stack.append(v)
+        if len(comp) >= 2:
+            comp_id += 1
+            for u in comp:
+                memb[u] = comp_id
+        else:
+            memb[i] = 0
+
+    return memb, edges
+
+
+def _jml_testlet_refit_dicho(X01, theta0, b0, testlet_memb, max_iter=25, damp=0.5):
+    """Simple JML refit for dichotomous Rasch + testlet effects.
+
+    Model: logit P(x=1) = theta_p - b_i + tau_{p,k(i)}
+    with tau_{p,0}=0 and mean_p tau_{p,k}=0 for identifiability.
+
+    Returns (theta, b, tau_pk) where tau_pk includes column 0 (all zeros).
+    """
+    import numpy as np
+
+    X = np.asarray(X01, dtype=float)
+    Pn, In = X.shape
+    theta = np.asarray(theta0, dtype=float).copy()
+    b = np.asarray(b0, dtype=float).copy()
+
+    k_of_i = np.array([int(testlet_memb.get(i, 0)) for i in range(In)], dtype=int)
+    Kt = int(np.max(k_of_i))
+    tau = np.zeros((Pn, Kt + 1), dtype=float)
+
+    def sigmoid(z):
+        z = np.clip(z, -35, 35)
+        return 1.0 / (1.0 + np.exp(-z))
+
+    damp = float(damp)
+    max_iter = int(max_iter)
+
+    M = np.isfinite(X)
+
+    for _ in range(max_iter):
+        eta = theta[:, None] - b[None, :] + tau[np.arange(Pn)[:, None], k_of_i[None, :]]
+        P = sigmoid(eta)
+        W = np.clip(P * (1.0 - P), 1e-8, None)
+
+        # theta updates
+        num = np.nansum((X - P) * M, axis=1)
+        den = np.nansum(W * M, axis=1)
+        step = np.where(den > 0, num / den, 0.0)
+        theta = theta + damp * step
+
+        # b updates
+        num = np.nansum((X - P) * M, axis=0)
+        den = np.nansum(W * M, axis=0)
+        step = np.where(den > 0, num / den, 0.0)
+        b = b - damp * step
+
+        # tau updates per testlet
+        for k in range(1, Kt + 1):
+            items_k = np.where(k_of_i == k)[0]
+            if items_k.size < 2:
+                continue
+            num = np.nansum(((X[:, items_k] - P[:, items_k]) * M[:, items_k]), axis=1)
+            den = np.nansum((W[:, items_k] * M[:, items_k]), axis=1)
+            step = np.where(den > 0, num / den, 0.0)
+            tau[:, k] = tau[:, k] + damp * step
+            tau[:, k] -= np.nanmean(tau[:, k])
+
+        # center theta and b
+        theta -= np.nanmean(theta)
+        b -= np.nanmean(b)
+
+    return theta, b, tau
+
+
 def demo_on_input_csv() -> RaschResult:
     """
     Convenience demo used by the ChatGPT sandbox.
@@ -1397,8 +1851,8 @@ def demo_on_input_csv() -> RaschResult:
         "/mnt/data/input.csv",
         id_col="name",
         drop_cols=("Profile",),
-        tau_fixed=(-0.86, 0.86),
-        estimate_tau=False,
+        tau_fixed=None,
+        estimate_tau=True,
         max_iter=100,
         tol=1e-5,
         damping=0.7,
@@ -1853,6 +2307,412 @@ def _build_item_vertices_relations_for_fig9(res):
     return vertices, rel
 
 
+def _beta_from_zstd_clusters(Z, cluster) -> float:
+    """Compute a simple *beta* between two clusters using person-level residual summaries.
+
+    For each person p, compute:
+      x_p = mean(Z[p, items in cluster A])
+      y_p = mean(Z[p, items in cluster B])
+    Then fit OLS: y = alpha + beta * x, and return beta.
+
+    This is a pragmatic, dashboard-friendly substitute for a full SEM/PLS path model:
+    it reports the directional association between two residual factors defined by the
+    first-contrast split (cluster sign).
+    """
+    import numpy as _np
+    Z = _np.asarray(Z, dtype=float)
+    if Z.ndim != 2:
+        return float("nan")
+    c = _np.asarray(cluster)
+    if c.ndim != 1 or c.size != Z.shape[1]:
+        return float("nan")
+    u = [int(x) for x in _np.unique(c[_np.isfinite(c)])]
+    u = sorted(u)
+    if len(u) < 2:
+        return float("nan")
+    a, b = u[0], u[1]
+    ma = c == a
+    mb = c == b
+    if ma.sum() < 1 or mb.sum() < 1:
+        return float("nan")
+    x = _np.nanmean(Z[:, ma], axis=1)
+    y = _np.nanmean(Z[:, mb], axis=1)
+    m = _np.isfinite(x) & _np.isfinite(y)
+    if m.sum() < 3:
+        return float("nan")
+    x = x[m]; y = y[m]
+    vx = float(_np.var(x))
+    if not _np.isfinite(vx) or vx <= 1e-12:
+        return float("nan")
+    cov = float(_np.mean((x - float(_np.mean(x))) * (y - float(_np.mean(y)))))
+    return cov / vx
+
+
+def _beta_p_from_zstd_clusters(Z, cluster):
+    """Return (beta, p_value, n) for OLS y ~ x derived from residual-factor summaries.
+
+    x_p = mean(Z[p, items in cluster A])
+    y_p = mean(Z[p, items in cluster B])
+
+    p-value is two-sided t-test for slope with df=n-2.
+    Uses scipy if available; otherwise normal approximation for df>=30.
+    """
+    import numpy as _np
+    import math as _math
+    Z = _np.asarray(Z, dtype=float)
+    if Z.ndim != 2:
+        return (float('nan'), float('nan'), 0)
+    c = _np.asarray(cluster)
+    if c.ndim != 1 or c.size != Z.shape[1]:
+        return (float('nan'), float('nan'), 0)
+    u = [int(x) for x in _np.unique(c[_np.isfinite(c)])]
+    u = sorted(u)
+    if len(u) < 2:
+        return (float('nan'), float('nan'), 0)
+    a, b = u[0], u[1]
+    ma = c == a
+    mb = c == b
+    if ma.sum() < 1 or mb.sum() < 1:
+        return (float('nan'), float('nan'), 0)
+    x = _np.nanmean(Z[:, ma], axis=1)
+    y = _np.nanmean(Z[:, mb], axis=1)
+    m = _np.isfinite(x) & _np.isfinite(y)
+    n = int(m.sum())
+    if n < 3:
+        return (float('nan'), float('nan'), n)
+    x = x[m]; y = y[m]
+    xbar = float(_np.mean(x)); ybar = float(_np.mean(y))
+    Sxx = float(_np.sum((x - xbar) ** 2))
+    if not _np.isfinite(Sxx) or Sxx <= 1e-12:
+        return (float('nan'), float('nan'), n)
+    beta = float(_np.sum((x - xbar) * (y - ybar)) / Sxx)
+    alpha = ybar - beta * xbar
+    resid = y - (alpha + beta * x)
+    df = n - 2
+    if df <= 0:
+        return (beta, float('nan'), n)
+    MSE = float(_np.sum(resid ** 2) / df)
+    se_beta = _math.sqrt(MSE / Sxx) if MSE >= 0 else float('nan')
+    if not _np.isfinite(se_beta) or se_beta <= 0:
+        return (beta, float('nan'), n)
+    t = beta / se_beta
+
+    # p-value
+    p = float('nan')
+    try:
+        from scipy.stats import t as _t
+        p = float(2.0 * (1.0 - _t.cdf(abs(t), df=df)))
+    except Exception:
+        # normal approx for reasonably large df
+        if df >= 30 and _np.isfinite(t):
+            # two-sided using erfc
+            p = float(_math.erfc(abs(t) / _math.sqrt(2.0)))
+    return (beta, p, n)
+
+
+def _q3_abs_upper_tri_from_zstd(Z, mode='items'):
+    """Compute |Q3| values from standardized residuals ZSTD.
+
+    mode='items': correlation between item columns (Q3 item-by-item)
+    mode='persons': correlation between person rows (person residual similarity)
+
+    Returns 1D array of absolute correlations from the upper triangle (excluding diagonal).
+    """
+    import numpy as _np
+    Z = _np.asarray(Z, dtype=float)
+    if Z.ndim != 2:
+        return _np.asarray([], dtype=float)
+    if mode == 'persons':
+        R = _np.corrcoef(Z)  # rows
+    else:
+        R = _np.corrcoef(Z, rowvar=False)  # cols
+    if R.ndim != 2 or R.shape[0] < 2:
+        return _np.asarray([], dtype=float)
+    iu = _np.triu_indices(R.shape[0], k=1)
+    q = _np.abs(R[iu])
+    q = q[_np.isfinite(q)]
+    return q
+
+
+def _q3_hist10_figure(q_abs, title):
+    """Return (fig, stats_df) where fig is a 10-bin histogram of |Q3| and stats include max/q95/mean."""
+    try:
+        import plotly.graph_objects as go
+    except Exception:
+        return (None, None)
+    import numpy as _np
+    import pandas as _pd
+    q = _np.asarray(q_abs, dtype=float)
+    q = q[_np.isfinite(q)]
+    if q.size == 0:
+        return (None, None)
+
+    bins = _np.linspace(0.0, 1.0, 11)  # 10 bins
+    counts, edges = _np.histogram(q, bins=bins)
+    labels = [f"{edges[i]:.1f}–{edges[i+1]:.1f}" for i in range(len(edges)-1)]
+
+    mean_q = float(_np.mean(q))
+    q95 = float(_np.quantile(q, 0.95))
+    qmax = float(_np.max(q))
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=labels, y=counts, hovertemplate="|Q3| bin=%{x}<br>Count=%{y}<extra></extra>"))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Residual correlation coefficient |Q3| (upper-triangular bins)",
+        yaxis_title="Count",
+        height=420,
+        margin=dict(l=60, r=20, t=80, b=60),
+    )
+
+    # Prominent summary callout (large red)
+    fig.add_annotation(
+        xref="paper", yref="paper",
+        x=0.02, y=0.98,
+        text=f"<b>mean(|Q3|)={mean_q:.3f} &nbsp; 95%(|Q3|)={q95:.3f}</b>",
+        showarrow=False,
+        font=dict(size=26, color="#b00"),
+        align="left",
+    )
+
+    stats = _pd.DataFrame([
+        {"max(|Q3|)": qmax, "95%(|Q3|)": q95, "mean(|Q3|)": mean_q, "N": int(q.size)}
+    ])
+    return (fig, stats)
+
+
+
+def _pv_rubin_group_compare(res, k: int = 10):
+    """Task 14: Plausible values (PV) + Rubin's rules for group comparisons.
+
+    We sample PV_m ~ N(theta, SE^2) for each person and each imputation m=1..k.
+    Then we estimate group means and (optionally) contrasts vs a reference group,
+    and pool estimates using Rubin's rules.
+
+    Returns
+    -------
+    t141 : pandas.DataFrame
+        Group pooled means and 95% CI.
+    t142 : pandas.DataFrame
+        Pairwise contrasts vs reference group (first sorted group).
+    note : str | None
+        Note if grouping had to be synthesized.
+    """
+    import numpy as _np
+    import pandas as _pd
+    import math as _math
+
+    pdf = getattr(res, 'person_df', None)
+    if not isinstance(pdf, _pd.DataFrame) or len(pdf) == 0:
+        return None, None, "(Task 14 skipped: person_df unavailable)"
+
+    # find theta and SE columns
+    th_col = None
+    se_col = None
+    for c in pdf.columns:
+        cl = str(c).lower()
+        if th_col is None and cl in ('theta','measure','eap','wle'):
+            th_col = c
+        if se_col is None and (cl in ('se','se_theta','se_measure','se(eap)','se_wle') or 'se' == cl):
+            se_col = c
+    # fallback common RaschOnline names
+    if th_col is None:
+        for c in pdf.columns:
+            if str(c).upper() == 'MEASURE':
+                th_col = c
+                break
+    if se_col is None:
+        for c in pdf.columns:
+            if str(c).upper() in ('SE','S.E.','SE_MEASURE'):
+                se_col = c
+                break
+
+    if th_col is None or se_col is None:
+        return None, None, "(Task 14 skipped: theta/SE columns not found in person_df)"
+
+    theta = _pd.to_numeric(pdf[th_col], errors='coerce').to_numpy(dtype=float)
+    se = _pd.to_numeric(pdf[se_col], errors='coerce').to_numpy(dtype=float)
+    m_ok = _np.isfinite(theta) & _np.isfinite(se) & (se > 0)
+    if m_ok.sum() < 5:
+        return None, None, "(Task 14 skipped: too few finite theta/SE)"
+
+    # group column detection
+    gcol = None
+    for c in pdf.columns:
+        if str(c).lower() in ('profile','group','class','grp'):
+            gcol = c
+            break
+    note = None
+    if gcol is None:
+        # try from res.debug
+        dbg = getattr(res, 'debug', None)
+        if isinstance(dbg, dict):
+            for k0 in ('profile','Profile','PROFILE','group'):
+                if k0 in dbg:
+                    try:
+                        gv = _np.asarray(dbg[k0])
+                        if gv.shape[0] == len(pdf):
+                            pdf = pdf.copy()
+                            pdf['profile'] = gv
+                            gcol = 'profile'
+                            break
+                    except Exception:
+                        pass
+    if gcol is None:
+        # synthesize a group: median split of theta
+        note = "(Task 14 note: group column not found; used median split of theta as a synthetic 2-group label.)"
+        med = _np.nanmedian(theta)
+        gv = _np.where(theta <= med, 'G1_low', 'G2_high')
+        pdf = pdf.copy()
+        pdf['profile'] = gv
+        gcol = 'profile'
+
+    g = pdf[gcol].astype(str).to_numpy()
+
+    # apply mask
+    theta = theta[m_ok]
+    se = se[m_ok]
+    g = g[m_ok]
+
+    # reproducible RNG (per run)
+    rng = _np.random.default_rng(12345)
+    k = int(max(2, k))
+
+    groups = sorted(set(g.tolist()))
+    if len(groups) < 2:
+        return None, None, "(Task 14 skipped: only one group present)"
+
+    # per-imputation estimates
+    Qm = {gr: [] for gr in groups}  # means
+    Um = {gr: [] for gr in groups}  # within variances of mean
+    Nm = {gr: int((g == gr).sum()) for gr in groups}
+
+    for _m in range(k):
+        pv = theta + se * rng.standard_normal(theta.shape[0])
+        for gr in groups:
+            pv_g = pv[g == gr]
+            if pv_g.size < 2:
+                Qm[gr].append(_np.nan)
+                Um[gr].append(_np.nan)
+                continue
+            Qm[gr].append(float(_np.mean(pv_g)))
+            Um[gr].append(float(_np.var(pv_g, ddof=1) / pv_g.size))
+
+    def _rubin_pool(q_list, u_list):
+        q = _np.asarray(q_list, dtype=float)
+        u = _np.asarray(u_list, dtype=float)
+        m = _np.isfinite(q) & _np.isfinite(u)
+        q = q[m]; u = u[m]
+        M = int(q.size)
+        if M < 2:
+            return _np.nan, _np.nan, _np.nan, _np.nan
+        Qbar = float(_np.mean(q))
+        Ubar = float(_np.mean(u))
+        B = float(_np.var(q, ddof=1))
+        T = Ubar + (1.0 + 1.0/M) * B
+        if T <= 0:
+            return Qbar, _np.nan, _np.nan, _np.nan
+        # df (Barnard-Rubin)
+        if B <= 1e-15:
+            df = 1e9
+        else:
+            df = (M - 1) * (1.0 + Ubar / ((1.0 + 1.0/M) * B))**2
+        seT = _math.sqrt(T)
+        return Qbar, seT, df, T
+
+    # Table 14.1
+    rows = []
+    for gr in groups:
+        Qbar, seT, df, T = _rubin_pool(Qm[gr], Um[gr])
+        if _np.isfinite(seT):
+            ci_lo = Qbar - 1.96 * seT
+            ci_hi = Qbar + 1.96 * seT
+        else:
+            ci_lo = _np.nan; ci_hi = _np.nan
+        rows.append({
+            'Group': gr,
+            'n': Nm.get(gr, _np.nan),
+            'PV mean (Rubin pooled)': Qbar,
+            'SE (total)': seT,
+            '95% CI lo': ci_lo,
+            '95% CI hi': ci_hi,
+            'df': df,
+        })
+    t141 = _pd.DataFrame(rows)
+
+    # Table 14.2 contrasts vs reference group
+    ref = groups[0]
+    rows2 = []
+    for gr in groups[1:]:
+        # difference per imputation
+        qd = _np.asarray(Qm[gr], float) - _np.asarray(Qm[ref], float)
+        ud = _np.asarray(Um[gr], float) + _np.asarray(Um[ref], float)
+        Qbar, seT, df, T = _rubin_pool(qd, ud)
+        tstat = Qbar / seT if _np.isfinite(Qbar) and _np.isfinite(seT) and seT>0 else _np.nan
+        # p-value (two-sided)
+        p = _np.nan
+        try:
+            import scipy.stats as _st
+            if _np.isfinite(tstat) and _np.isfinite(df):
+                p = float(2.0 * (1.0 - _st.t.cdf(abs(tstat), df)))
+        except Exception:
+            # normal approx
+            if _np.isfinite(tstat):
+                p = float(2.0 * (1.0 - 0.5*(1.0+_math.erf(abs(tstat)/_math.sqrt(2.0)))))
+        ci_lo = Qbar - 1.96 * seT if _np.isfinite(seT) else _np.nan
+        ci_hi = Qbar + 1.96 * seT if _np.isfinite(seT) else _np.nan
+        rows2.append({
+            'Contrast': f"{gr} - {ref}",
+            'Diff (Rubin pooled)': Qbar,
+            'SE (total)': seT,
+            't': tstat,
+            'df': df,
+            'p': p,
+            '95% CI lo': ci_lo,
+            '95% CI hi': ci_hi,
+        })
+    t142 = _pd.DataFrame(rows2)
+
+    return t141, t142, note
+
+
+
+
+def _q3_abs_from_zstd(Z, mode: str = "items"):
+    """Extract |Q3| values from the upper-triangular part of a residual correlation matrix.
+
+    Parameters
+    ----------
+    Z : array-like, shape (P, I)
+        Standardized residual matrix (persons x items).
+    mode : {'items','persons'}
+        - 'items': compute item-item residual correlations (Q3) from columns of Z.
+        - 'persons': compute person-person residual correlations from rows of Z.
+
+    Returns
+    -------
+    q_abs : np.ndarray
+        1D array of absolute correlations from the upper triangular (excluding diagonal).
+    """
+    import numpy as _np
+    Z = _np.asarray(Z, dtype=float)
+    if Z.ndim != 2:
+        return _np.asarray([], dtype=float)
+
+    if str(mode).lower().startswith('person'):
+        R = _np.corrcoef(Z)  # rowvar=True
+    else:
+        R = _np.corrcoef(Z, rowvar=False)
+
+    if R.ndim != 2 or R.shape[0] != R.shape[1]:
+        return _np.asarray([], dtype=float)
+
+    iu = _np.triu_indices(R.shape[0], k=1)
+    q = _np.abs(R[iu])
+    q = q[_np.isfinite(q)]
+    return q
+
+
 def _dif_forest_from_profile(res, profile_value=2):
     """Approx DIF forest plot using standardized mean difference of residuals between Profile==value vs others."""
     import numpy as _np
@@ -2062,6 +2922,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
     # Unified config getter (HTML form params + res.debug + kwargs)
     cfg = {}
     fig11_rendered = False
+    tcp_rendered = False
     # PATCH: fig11 guard to avoid NameError/UnboundLocalError
     _fig11 = None
     fig11 = None
@@ -2148,7 +3009,8 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
     try:
         tau = getattr(res, "tau", [])
         tau_list = list(tau) if not hasattr(tau, "tolist") else tau.tolist()
-        tau_str = ", ".join([f"{float(t):+.2f}" for t in tau_list])
+        tau_str = ", ".join([f"{float(t):+.4f}" for t in tau_list])
+        tau_maxabs = float(np.max(np.abs(tau_list))) if len(tau_list) else 0.0
     except Exception:
         tau_str = ""
 
@@ -2192,7 +3054,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                       f"last_error={_html.escape(str(getattr(res,'last_error','')))}, "
                       f"stop_reason={_html.escape(str(getattr(res,'stop_reason','')))}</div>"
                       f"<div>Categories: {int(getattr(res,'min_cat',0))}..{int(getattr(res,'max_cat',0))}</div>"
-                      f"<div>Step thresholds (tau): {tau_str}</div>"
+                      f"<div>Step thresholds (tau): {tau_str} (max|tau|={tau_maxabs:.4f})</div>"
                       f"</div>")
 
     # Winsteps summary block (text)
@@ -2613,6 +3475,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
             ("person_estimates.csv", "Person estimates"),
             ("item_estimates.csv", "Item estimates"),
             ("observed_response.csv", "Observed responses (matrix)"),
+            ("simulated_response.csv", "Simulated responses (Rasch model)"),
             ("expected_score.csv", "Expected scores (matrix)"),
             ("residual.csv", "Residuals (matrix)"),
             ("zscore.csv", "Z-scores (standardized residuals, matrix)"),
@@ -2768,9 +3631,21 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                         return fig
 
                     dbg = getattr(res, "debug", {}) if isinstance(getattr(res, "debug", None), dict) else {}
-                    X_obs = dbg.get("X0", None) or dbg.get("X_obs", None) or dbg.get("X", None)
+                    is_cont = bool(dbg.get('is_continuous_input', False))
+                    X_obs = dbg.get('X_post', None) or dbg.get('X_transformed', None) or dbg.get('X0', None) or dbg.get('X_obs', None)
+                    if (X_obs is None) and (not is_cont):
+                        X_obs = dbg.get('X', None)
                     E_exp = dbg.get("E_exp", None)
                     Zstd  = dbg.get("ZSTD", None)
+
+                    # residuals in score units: O - E (original category scale)
+                    R_resid = None
+                    if X_obs is not None and E_exp is not None:
+                        try:
+                            R_resid = _np.asarray(X_obs, dtype=float) - _np.asarray(E_exp, dtype=float)
+                        except Exception:
+                            R_resid = None
+
                     # If ZSTD is missing, compute a safe fallback so KIDMAP/Figure 9 can render.
                     if Zstd is None:
                         try:
@@ -2779,7 +3654,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                                 sd[~_np.isfinite(sd)] = 0.0
                                 sd[sd <= 0] = 1.0
                                 Zstd = R_resid / sd
-                            elif X_obs is not None and isinstance(X_obs, _np.ndarray) and _np.asarray(X_obs).ndim == 2:
+                            elif X_obs is not None and _np.asarray(X_obs).ndim == 2:
                                 Xtmp = _np.asarray(X_obs, dtype=float)
                                 mu = _np.nanmean(Xtmp, axis=0, keepdims=True)
                                 sd = _np.nanstd(Xtmp, axis=0, ddof=1, keepdims=True)
@@ -2796,14 +3671,6 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                                     pass
                         except Exception:
                             Zstd = None
-
-                    # residuals in score units: O - E (original category scale)
-                    R_resid = None
-                    if X_obs is not None and E_exp is not None:
-                        try:
-                            R_resid = _np.asarray(X_obs, dtype=float) - _np.asarray(E_exp, dtype=float)
-                        except Exception:
-                            R_resid = None
 
                     eig_obs = _eigvals_from_matrix(X_obs) if X_obs is not None else None
                     eig_res = _eigvals_from_matrix(R_resid) if R_resid is not None else None
@@ -2963,9 +3830,22 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
 
                         # Fallback: build from residual Z if not provided
                         if _nodes9 is None or len(_nodes9) == 0:
-                            _nodes9, _edges9 = _build_item_vertices_relations_for_fig9(res)
+                            _tmp9 = _build_item_vertices_relations_for_fig9(res)
+                            _nodes9 = None; _edges9 = None
+                            if isinstance(_tmp9, tuple) and len(_tmp9) >= 2:
+                                _nodes9, _edges9 = _tmp9[0], _tmp9[1]
+                            else:
+                                _nodes9 = _tmp9
+                                _edges9 = None
                             try:
                                 _run_dir = getattr(res, "run_dir", None)
+                                if not _run_dir:
+                                    try:
+                                        _rid = getattr(res, "run_id", None) or getattr(res, "runid", None)
+                                        if _rid:
+                                            _run_dir = str(_resolve_run_dir(str(_rid)))
+                                    except Exception:
+                                        _run_dir = None
                                 if _run_dir:
                                     from pathlib import Path as _Path
                                     _p = _Path(str(_run_dir))
@@ -2988,6 +3868,72 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                                 _nodes9['value'] = _pd.to_numeric(_nodes9[ss_src], errors='coerce')
                         if _nodes9 is None:
                             _nodes9, _edges9 = _build_vertices_relations_from_residuals(res, idf)
+
+                        # Beta coefficient between the 2 clusters (path/SEM-like): computed from person x item ZSTD
+                        _beta9 = None
+                        _p_beta9 = None
+                        try:
+                            _Z9 = getattr(res, 'debug', {}).get('ZSTD', None) if isinstance(getattr(res, 'debug', None), dict) else None
+                            if _Z9 is not None and _nodes9 is not None and 'cluster' in _nodes9.columns:
+                                _beta9, _p_beta9, _n_beta9 = _beta_p_from_zstd_clusters(_Z9, _nodes9['cluster'].to_numpy())
+                        except Exception:
+                            _beta9 = None
+                            _p_beta9 = None
+                        # Compute PTMA and suspected testlet flags for Figure 9 hover/marking
+                        try:
+                            dbg = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+                            Xobs0 = dbg.get('X_obs', None) or dbg.get('X', None)
+                            th0 = getattr(res, 'theta', None)
+                            if Xobs0 is not None and th0 is not None and _nodes9 is not None and len(_nodes9):
+                                import numpy as _np
+                                import pandas as _pd
+                                _X = _np.asarray(Xobs0, dtype=float)
+                                _th = _np.asarray(th0, dtype=float)
+                                # derive item names key from nodes
+                                if 'name' in _nodes9.columns:
+                                    _nodes9['_ITEM_KEY_'] = _nodes9['name'].astype(str).apply(lambda s: s.split('(')[0].strip())
+                                else:
+                                    _nodes9['_ITEM_KEY_'] = _nodes9.iloc[:,0].astype(str).apply(lambda s: s.split('(')[0].strip())
+                                # PTMA
+                                try:
+                                    _pt = compute_ptma_from_matrices(_X, _th, item_names=None, min_n=5)
+                                    # map by column order -> item_df ITEM when available
+                                    idf0 = getattr(res, 'item_df', None)
+                                    if isinstance(idf0, _pd.DataFrame) and 'ITEM' in idf0.columns and len(idf0) == _X.shape[1]:
+                                        _pt['ITEM'] = idf0['ITEM'].astype(str).tolist()
+                                    _pt['ITEM'] = _pt['ITEM'].astype(str)
+                                    _pt['ITEM_KEY'] = _pt['ITEM'].apply(lambda s: s.split('(')[0].strip())
+                                    _nodes9 = _nodes9.merge(_pt[['ITEM_KEY','PTMA']], left_on='_ITEM_KEY_', right_on='ITEM_KEY', how='left')
+                                except Exception:
+                                    pass
+                                # Q3max from ZSTD residual correlation between items
+                                try:
+                                    Z = dbg.get('ZSTD', None)
+                                    if Z is not None:
+                                        Zm = _np.asarray(Z, dtype=float)
+                                        if Zm.ndim == 2 and Zm.shape[1] == _X.shape[1]:
+                                            Q3 = _np.corrcoef(Zm, rowvar=False)
+                                            Q3_abs = _np.abs(Q3)
+                                            _np.fill_diagonal(Q3_abs, _np.nan)
+                                            q3max = _np.nanmax(Q3_abs, axis=0)
+                                            # attach by item_df order
+                                            if isinstance(idf0, _pd.DataFrame) and 'ITEM' in idf0.columns and len(idf0) == len(q3max):
+                                                q3_df = _pd.DataFrame({'ITEM_KEY': idf0['ITEM'].astype(str).apply(lambda s: s.split('(')[0].strip()).tolist(),
+                                                                     'Q3MAX': q3max})
+                                                _nodes9 = _nodes9.merge(q3_df, left_on='_ITEM_KEY_', right_on='ITEM_KEY', how='left')
+                                except Exception:
+                                    pass
+                                # Flag suspected testlet: high Q3 + low PTMA (defaults 0.10 / 0.10)
+                                try:
+                                    _nodes9['is_testlet'] = (
+                                        _pd.to_numeric(_nodes9.get('Q3MAX', _np.nan), errors='coerce') > 0.10
+                                    ) & (
+                                        _pd.to_numeric(_nodes9.get('PTMA', _np.nan), errors='coerce') < 0.10
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         fig9 = kano_plot_aligned(
                             nodes=_nodes9,
                             edges=_edges9,
@@ -2996,6 +3942,8 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                             y_col="__y__",
                             x_label="Delta (item difficulty, logit)",
                             y_label="Contrast 1 loading",
+                            beta_value=_beta9,
+                            beta_p=_p_beta9,
                         )
                         fig9_html = _plotly_plot(fig9, output_type='div', include_plotlyjs=False)
                         
@@ -3286,7 +4234,47 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                             html_parts.append("<div class='note'>(Variance table/list failed: " + _html.escape(repr(_e)) + ")</div>")
 
                         html_parts.append('<h2>Dimension–Kano Map with Zscore residuals (Figure 9)</h2>')
+                        fig9_rendered = True
                         html_parts.append(fig9_html)
+
+                        # Beta annotation (contrast-loading split)
+                        try:
+                            _bnote = (
+                                "<div class='note'>"
+                                "<b>Beta (path coefficient)</b>: OLS slope for <i>y</i>~<i>x</i>, where "
+                                "x = mean(ZSTD) across items in Cluster 1 and y = mean(ZSTD) across items in Cluster 2. "
+                                "Clusters are defined by the sign of the <b>Contrast 1 loading</b> (residual PCA)."
+                            )
+                            if _beta9 is not None and _p_beta9 is not None:
+                                try:
+                                    _bnote += " &nbsp; <b style='color:#b00;font-size:22px'>Beta=%.2f, p=%.3g</b>" % (float(_beta9), float(_p_beta9))
+                                except Exception:
+                                    pass
+                            _bnote += "</div>"
+                            html_parts.append(_bnote)
+                        except Exception:
+                            pass
+
+                        # Figure 9b: 10-bin frequency histogram of |Q3| (items; upper triangular)
+                        try:
+                            _Z9_hist = getattr(res, 'debug', {}).get('ZSTD', None) if isinstance(getattr(res, 'debug', None), dict) else None
+                            if _Z9_hist is not None:
+                                _q9 = _q3_abs_from_zstd(_Z9_hist, mode='items')
+                                _fig9b, _tab9b = _q3_hist10_figure(_q9, title='Figure 9b — |Q3| frequency (items; upper triangular)')
+                                if _fig9b is not None:
+                                    html_parts.append("<h3>Figure 9b — Residual correlation frequency (items)</h3>")
+                                    html_parts.append(_plotly_plot(_fig9b, include_plotlyjs=False, output_type='div'))
+                                if _tab9b is not None:
+                                    html_parts.append(_df_to_html(_tab9b, max_rows=10))
+                        except Exception as _e9b:
+                            html_parts.append("<div class='note' style='color:#b00'>(Figure 9b failed: " + _html.escape(repr(_e9b)) + ")</div>")
+
+                        # Reference link under each Dimension-Kano plot
+                        try:
+                            html_parts.append("<div class='note'>Reference: <a href='https://pmc.ncbi.nlm.nih.gov/articles/PMC5978551/' target='_blank' rel='noopener'>PMC5978551</a></div>")
+                        except Exception:
+                            pass
+
 
 
                                                 
@@ -3314,6 +4302,206 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                 html_parts.append(_df_to_html(_tbl, max_rows=200))
                         except Exception as _e_list:
                             html_parts.append("<div class='note'>(Figure 9 item list failed: " + _html.escape(repr(_e_list)) + ")</div>")
+
+
+                        # ==========================
+                        # Figure 9.2 — Rasch-simulated data (under fitted model)
+                        # ==========================
+                        html_parts.append("<h3>Figure 9.2 — Residual contrasts for Rasch-simulated data</h3>")
+                        html_parts.append("<div class='note'>Simulated responses are generated under the fitted Rasch model (preserving missing cells) and saved as <b>simulated_response.csv</b> in the run folder.</div>")
+                        try:
+                            import numpy as _np
+                            import pandas as _pd
+                            from types import SimpleNamespace as _SNS
+
+                            # 1) simulate under fitted model, preserve missingness
+                            X_sim = _simulate_rasch_matrix_from_res(res, seed=12345)
+
+                            # 2) export simulated matrix to CSV (shift back by min_cat)
+                            _run_dir = getattr(res, "run_dir", None)
+                            if not _run_dir:
+                                try:
+                                    _rid = getattr(res, "run_id", None) or getattr(res, "runid", None)
+                                    if _rid:
+                                        _run_dir = str(_resolve_run_dir(str(_rid)))
+                                except Exception:
+                                    _run_dir = None
+                            if _run_dir:
+                                from pathlib import Path as _Path
+                                _p = _Path(str(_run_dir))
+                                _minc = int(getattr(res, "min_cat", 0))
+                                sim_out = _pd.DataFrame(X_sim + _minc)
+                                # name columns like the input items when available
+                                try:
+                                    _idf = getattr(res, "item_df", None)
+                                    if isinstance(_idf, _pd.DataFrame) and "ITEM" in _idf.columns and len(_idf) == sim_out.shape[1]:
+                                        sim_out.columns = _idf["ITEM"].astype(str).tolist()
+                                except Exception:
+                                    pass
+                                sim_out.to_csv(str(_p / "simulated_response.csv"), index=False, encoding="utf-8-sig")
+
+                            # 3) residual PCA on simulated data (ZSTD)
+                            Z_sim = _zstd_from_x_and_model(res, X_sim)
+
+                            # eigenvalues list from residual contrast decomposition
+                            try:
+                                _loading_sim, _eig1_sim, _w_sim = _contrast1_from_zstd(Z_sim)
+                                v1_sim = float(_w_sim[0]) if _w_sim is not None and len(_w_sim) else _np.nan
+                            except Exception:
+                                _w_sim = None
+                                v1_sim = _np.nan
+
+                            # v1 observed (from fitted residuals)
+                            v1_obs = _np.nan
+                            try:
+                                if isinstance(getattr(res, "debug", None), dict) and "ZSTD" in res.debug:
+                                    _loading_obs, _eig1_obs, _w_obs = _contrast1_from_zstd(_np.asarray(res.debug["ZSTD"], dtype=float))
+                                    v1_obs = float(_w_obs[0]) if _w_obs is not None and len(_w_obs) else _np.nan
+                            except Exception:
+                                pass
+
+                            # ratio + DC index (higher => closer to unidimensional residual structure)
+                            r_sim_over_obs = _np.nan
+                            DC = _np.nan
+                            try:
+                                if _np.isfinite(v1_sim) and _np.isfinite(v1_obs) and v1_obs > 0:
+                                    r_sim_over_obs = float(v1_sim / v1_obs)
+                                    DC = float(r_sim_over_obs / (1.0 + r_sim_over_obs))
+                            except Exception:
+                                pass
+
+                            # build nodes/edges + Kano plot for simulated residuals
+                            _idf = getattr(res, "item_df", None)
+                            _tmp_res = _SNS(debug={"ZSTD": Z_sim}, item_df=_idf)
+                            _nodes_sim, _edges_sim = _build_vertices_relations_from_residuals(_tmp_res, _idf) if isinstance(_idf, _pd.DataFrame) else (None, None)
+                            if _nodes_sim is None or len(_nodes_sim) == 0:
+                                _tmp_res2 = _SNS(debug={"ZSTD": Z_sim}, item_df=_idf)
+                                _nodes_sim, _edges_sim = _build_item_vertices_relations_for_fig9(_tmp_res2)
+
+                            # ensure y axis uses loading (not ss)
+                            if _nodes_sim is not None and len(_nodes_sim):
+                                cols9s = {c.lower(): c for c in _nodes_sim.columns}
+                                y_src_s = cols9s.get('loading') or cols9s.get('contrast_loading') or 'value'
+                                _nodes_sim['__y__'] = _pd.to_numeric(_nodes_sim.get(y_src_s, _np.nan), errors='coerce')
+                                ss_src_s = cols9s.get('ss_i') or cols9s.get('ss(i)') or cols9s.get('ssi') or cols9s.get('silhouette')
+                                if ss_src_s is not None and ss_src_s in _nodes_sim.columns:
+                                    _nodes_sim['value'] = _pd.to_numeric(_nodes_sim[ss_src_s], errors='coerce')
+                            # Beta coefficient between the 2 clusters for the simulated residual structure
+                            _beta9s = None
+                            _p_beta9s = None
+                            try:
+                                if _nodes_sim is not None and 'cluster' in _nodes_sim.columns:
+                                    _beta9s, _p_beta9s, _n_beta9s = _beta_p_from_zstd_clusters(Z_sim, _nodes_sim['cluster'].to_numpy())
+                            except Exception:
+                                _beta9s = None
+                                _p_beta9s = None
+
+                            fig9_2 = kano_plot_aligned(
+                                nodes=_nodes_sim,
+                                edges=_edges_sim,
+                                title_suffix=" (Figure 9.2 — simulated under fitted Rasch)",
+                                x_col="value2",
+                                y_col="__y__",
+                                x_label="Delta (item difficulty, logit)",
+                                y_label="Contrast 1 loading (sim residuals)",
+                                beta_value=_beta9s,
+                                beta_p=_p_beta9s,
+                            )
+                            fig9_2_html = _plotly_plot(fig9_2, output_type='div', include_plotlyjs=False)
+
+                            # eigenvalue table for simulated residuals (first 10)
+                            eig_df = None
+                            try:
+                                if _w_sim is not None and len(_w_sim):
+                                    eig_df = _pd.DataFrame({
+                                        "Contrast": [f"{i+1}" for i in range(min(10, len(_w_sim)))],
+                                        "Eigenvalue": [float(x) for x in _w_sim[:min(10, len(_w_sim))]],
+                                    })
+                            except Exception:
+                                eig_df = None
+
+                            html_parts.append("<h2>Rasch-simulated residual analysis (Figure 9.2)</h2>")
+                            html_parts.append("<p class='note'>Figure 9.2 repeats the residual PCA/Kano display using data simulated from the fitted Rasch model (same persons/items; preserved missing cells). The simulated CSV is downloadable in the Downloads section.</p>")
+                            if isinstance(eig_df, _pd.DataFrame) and len(eig_df):
+                                html_parts.append("<h3>STANDARDIZED RESIDUAL variance (simulated) — Eigenvalues</h3>")
+                                html_parts.append(_df_to_html(eig_df, max_rows=20))
+                            html_parts.append(fig9_2_html)
+
+
+                            # Beta annotation (simulated; contrast-loading split)
+                            try:
+                                _bnote_s = (
+                                    "<div class='note'>"
+                                    "<b>Beta (path coefficient; simulated)</b>: same definition as Figure 9, computed on simulated ZSTD."
+                                )
+                                if _beta9s is not None and _p_beta9s is not None:
+                                    try:
+                                        _bnote_s += " &nbsp; <b style='color:#b00;font-size:22px'>Beta=%.2f, p=%.3g</b>" % (float(_beta9s), float(_p_beta9s))
+                                    except Exception:
+                                        pass
+                                _bnote_s += "</div>"
+                                html_parts.append(_bnote_s)
+                            except Exception:
+                                pass
+
+
+                            # Figure 9.2b: 10-bin frequency histogram of |Q3| (simulated items; upper triangular)
+                            try:
+                                if Z_sim is not None:
+                                    _q9s = _q3_abs_from_zstd(Z_sim, mode='items')
+                                    _fig9s_b, _tab9s_b = _q3_hist10_figure(_q9s, title='Figure 9.2b — |Q3| frequency (simulated items; upper triangular)')
+                                    if _fig9s_b is not None:
+                                        html_parts.append("<h3>Figure 9.2b — Residual correlation frequency (simulated items)</h3>")
+                                        html_parts.append(_plotly_plot(_fig9s_b, include_plotlyjs=False, output_type='div'))
+                                    if _tab9s_b is not None:
+                                        html_parts.append(_df_to_html(_tab9s_b, max_rows=10))
+                            except Exception as _e9sb:
+                                html_parts.append("<div class='note' style='color:#b00'>(Figure 9.2b failed: " + _html.escape(repr(_e9sb)) + ")</div>")
+
+                            # Reference
+                            try:
+                                html_parts.append("<div class='note'>Reference: <a href='https://pmc.ncbi.nlm.nih.gov/articles/PMC5978551/' target='_blank' rel='noopener'>PMC5978551</a></div>")
+                            except Exception:
+                                pass
+
+
+                            # annotation beneath Fig 9.2 with DC index (red table; r=v1_obs/v1_sim)
+                            try:
+                                v1o = float(v1_obs) if _np.isfinite(v1_obs) else _np.nan
+                                v1s = float(v1_sim) if _np.isfinite(v1_sim) else _np.nan
+                                r_obs_over_sim = (v1o / v1s) if (_np.isfinite(v1o) and _np.isfinite(v1s) and v1s != 0.0) else _np.nan
+                                DC2 = (r_obs_over_sim / (1.0 + r_obs_over_sim)) if _np.isfinite(r_obs_over_sim) else _np.nan
+
+                                # thumb rule (user-specified)
+                                cls = ""
+                                if _np.isfinite(DC2):
+                                    if DC2 < 0.60:
+                                        cls = "Toward unidimensionality (simulation-like)"
+                                    elif DC2 < 0.70:
+                                        cls = "Weak multidimensionality"
+                                    else:
+                                        cls = "Strong multidimensionality"
+
+                                dc_html = (
+                                    "<div style='margin:10px 0; padding:10px; border:2px solid #b00; border-radius:8px;'>"
+                                    "<table class='tbl' style='font-size:24px; color:#b00; font-weight:800; width:auto; border-color:#b00;'>"
+                                    "<tr><th style='border-color:#b00;'>Metric</th><th style='border-color:#b00;'>Value</th></tr>"
+                                    f"<tr><td style='border-color:#b00;'>v1_obs (original)</td><td style='border-color:#b00;'>{v1o:.3f}</td></tr>"
+                                    f"<tr><td style='border-color:#b00;'>v1_sim (simulated)</td><td style='border-color:#b00;'>{v1s:.3f}</td></tr>"
+                                    f"<tr><td style='border-color:#b00;'>r = v1_obs / v1_sim</td><td style='border-color:#b00;'>{r_obs_over_sim:.3f}</td></tr>"
+                                    f"<tr><td style='border-color:#b00;'>DC = r/(1+r)</td><td style='border-color:#b00;'>{DC2:.3f}</td></tr>"
+                                    "</table>"
+                                    "<div style='margin-top:8px; font-size:20px; color:#b00; font-weight:800;'>"
+                                    "Thumb rule: DC&lt;0.60 toward unidimensionality; 0.60–0.69 weak multidimensionality; DC≥0.70 strong multidimensionality."
+                                )
+                                if cls:
+                                    dc_html += f" &nbsp; ⇒ <span style='text-decoration:underline;'>{_html.escape(cls)}</span>"
+                                dc_html += "</div></div>"
+                                html_parts.append(dc_html)
+                            except Exception:
+                                pass
+                        except Exception as _e_sim:
+                            html_parts.append("<div class='note'>(Figure 9.2 simulation block failed: " + _html.escape(repr(_e_sim)) + ")</div>")
                     except Exception as _e:
                         html_parts.append('<h2>Figure 9</h2><pre>Failed to draw Kano plot: ' + str(_e) + '</pre>')
                         # Figure 10/11: ICC and CPC (separate) for selected item_no
@@ -3355,6 +4543,34 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                 html_parts.append("<h2>ICC (Figure 10)</h2>")
                                 html_parts.append(_plotly_plot(fig10, include_plotlyjs=False, output_type="div"))
 
+                                # Figure 10.2: CAC (category average curves) — step logistics by tau
+                                try:
+                                    theta_grid2 = _np.linspace(-5.0, 5.0, 201)
+                                    fig10_2 = go.Figure()
+                                    # tau: RSM step parameters; draw per step curve: logistic(theta - (delta + tau_k))
+                                    for k in range(int(len(tau))):
+                                        try:
+                                            t_k = float(tau[k])
+                                        except Exception:
+                                            t_k = _np.nan
+                                        if not _np.isfinite(t_k):
+                                            continue
+                                        p_k = 1.0 / (1.0 + _np.exp(-(theta_grid2 - (b_j + t_k))))
+                                        fig10_2.add_trace(go.Scatter(
+                                            x=theta_grid2, y=p_k, mode='lines',
+                                            name=f"Step {k+1} (tau={t_k:.2f})"
+                                        ))
+                                    fig10_2.update_layout(
+                                        title=f"CAC (Figure 10.2) — Item {item_no_sel}: {idf2['ITEM'].iloc[item_no_sel-1]}",
+                                        xaxis_title="Ability (theta, logit)",
+                                        yaxis_title="Probability (logistic step)",
+                                        height=520
+                                    )
+                                    html_parts.append("<h2>CAC (Figure 10.2)</h2>")
+                                    html_parts.append(_plotly_plot(fig10_2, include_plotlyjs=False, output_type="div"))
+                                except Exception as _e_cac:
+                                    html_parts.append("<div class='note' style='color:#b00'>(Figure 10.2 CAC failed: " + _html.escape(repr(_e_cac)) + ")</div>")
+
                                 # Figure 11: CPC (category probability curves)
                                 _fig11 = None
                                 try:
@@ -3363,6 +4579,98 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                         html_parts.append("<h2>CPC (Figure 11)</h2>")
                                         html_parts.append(_plotly_plot(_fig11, include_plotlyjs=False, output_type="div"))
                                         fig11_rendered = True
+
+                                        # Figure 11.2: Winsteps Table 2.5 style Category Average Plot (CAP)
+                                        try:
+                                            pass  # [TCP11.2-DEDUP] duplicate block removed
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                        except Exception as _e_cap:
+                                            pass  # [TCP11.2-DEDUP] duplicate block removed
                                     else:
                                         html_parts.append("<div class='note'>(Figure 11 skipped: CPC not available.)</div>")
                                 except Exception as _e11:
@@ -3392,6 +4700,7 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                         fig11_rendered = True
                         except Exception as _e11b:
                             html_parts.append("<div class='note' style='color:#b00'><b>Figure 11 CPC failed:</b> " + _html.escape(repr(_e11b)) + "</div>")
+                        # [DEDUP] CAP/TCP forced-render block removed to avoid duplicates.
 
                         # DIF table for Profile (0/1) if available, dichotomous only
                         try:
@@ -3451,7 +4760,7 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                         except Exception as _e:
                             html_parts.append("<div class='note'>(DIF table failed: " + _html.escape(repr(_e)) + ")</div>")
                     else:
-                        html_parts.append("<div class='note'>(Figure 9 skipped: residual matrix unavailable)</div>")
+                        # [DEDUP] Figure 9 recovery block removed; Figure 9 is rendered once in the main pipeline.
 
 # Figure 10/11: determine target item index (from config/form) (1-based -> 0-based)
                         try:
@@ -3478,22 +4787,163 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                 except Exception:
                                     _note10 = None
                                 _safe_add_fig(html_parts, _fig10, "Figure 10 — ICC", note=_note10)
+
+
+                                # Figure 10.2: CAC (category average curves) — step logistics by tau
+                                try:
+                                    # pull delta and tau for selected item
+                                    idf2 = getattr(res, 'item_df', None)
+                                    tau = _np.asarray(getattr(res, 'tau', []), dtype=float)
+                                    bvec = _np.asarray(getattr(res, 'b', []), dtype=float) if hasattr(res, 'b') else _np.array([])
+                                    # fallback delta from item_df
+                                    if (bvec.size == 0 or not _np.isfinite(bvec).any()) and isinstance(idf2, _pd.DataFrame) and 'DELTA' in idf2.columns:
+                                        bvec = _pd.to_numeric(idf2['DELTA'], errors='coerce').to_numpy(dtype=float)
+                                    item_no_sel = _item_no
+                                    if isinstance(idf2, _pd.DataFrame) and len(idf2) > 0:
+                                        item_no_sel = min(max(int(_item_no), 1), len(idf2))
+                                    if tau is not None and len(tau) > 0 and bvec is not None and len(bvec) > (_item_idx0) and _np.isfinite(bvec[_item_idx0]):
+                                        b_j = float(bvec[_item_idx0])
+                                        theta_grid2 = _np.linspace(-5.0, 5.0, 201)
+                                        fig10_2 = go.Figure()
+                                        for k in range(int(len(tau))):
+                                            t_k = float(tau[k]) if _np.isfinite(tau[k]) else _np.nan
+                                            if not _np.isfinite(t_k):
+                                                continue
+                                            p_k = 1.0 / (1.0 + _np.exp(-(theta_grid2 - (b_j + t_k))))
+                                            fig10_2.add_trace(go.Scatter(x=theta_grid2, y=p_k, mode='lines', name=f"Step {k+1} (tau={t_k:.2f})"))
+                                        ttl = f"CAC (Figure 10.2) — Item {item_no_sel}"
+                                        try:
+                                            if isinstance(idf2, _pd.DataFrame) and 'ITEM' in idf2.columns:
+                                                ttl += f": {idf2['ITEM'].iloc[item_no_sel-1]}"
+                                        except Exception:
+                                            pass
+                                        fig10_2.update_layout(title=ttl, xaxis_title='Ability (theta, logit)', yaxis_title='Probability (logistic step)', height=520)
+                                        html_parts.append("<h2>CAC (Figure 10.2)</h2>")
+                                        html_parts.append(_plotly_plot(fig10_2, include_plotlyjs=False, output_type='div'))
+                                except Exception as _e_cac:
+                                    html_parts.append("<div class='note' style='color:#b00'>(Figure 10.2 CAC failed: " + _html.escape(repr(_e_cac)) + ")</div>")
+
                                 # Figure 11 — CPC (category probability curves)
                                 try:
                                     _item_no_sel2 = 1
                                     try:
-                                        idf_cpc2 = getattr(res, "item_df", None)
+                                        idf_cpc2 = getattr(res, 'item_df', None)
                                         if isinstance(idf_cpc2, _pd.DataFrame) and len(idf_cpc2) > 0:
-                                            _item_no_sel2 = min(max(int(item_no), 1), len(idf_cpc2))
+                                            _item_no_sel2 = min(max(int(_item_no), 1), len(idf_cpc2))
                                     except Exception:
                                         _item_no_sel2 = 1
                                     _fig11c = _draw_fig11_cpc(res, _item_no_sel2 - 1)
                                     _note11 = None
                                     try:
-                                        _note11 = globals().get("FIGURE_GUIDE_NOTES", {}).get("Figure 11", None) if isinstance(globals().get("FIGURE_GUIDE_NOTES", None), dict) else None
+                                        _note11 = globals().get('FIGURE_GUIDE_NOTES', {}).get('Figure 11', None) if isinstance(globals().get('FIGURE_GUIDE_NOTES', None), dict) else None
                                     except Exception:
                                         _note11 = None
-                                    _safe_add_fig(html_parts, _fig11c, "Figure 11 — CPC", note=_note11)
+                                    _safe_add_fig(html_parts, _fig11c, 'Figure 11 — CPC', note=_note11)
+
+                                    # Figure 11.2 — CAP (Winsteps Table 2.5)
+                                    try:
+                                        _fig11_2, _cap_tbl = _draw_fig11_2_cap(res, x_min=-6, x_max=5, x_step=1)
+                                        _note11_2 = (
+                                            "Category Average Plot (CAP): for each item, the digits 0/1/2 are placed at the "
+                                            "mean person measure (θ) of respondents who chose that category. Items are ordered "
+                                            "by delta (difficulty) descending; labels include δ and Infit MNSQ."
+                                        )
+                                        _safe_add_fig(html_parts, _fig11_2, 'Figure 11.2 — CAP (Table 2.5)', note=_note11_2)
+                                        try:
+                                            # show a small preview table below the plot
+                                            if isinstance(_cap_tbl, _pd.DataFrame):
+                                                _cap_show = _cap_tbl.copy()
+                                                for c in ('cat0','cat1','cat2'):
+                                                    if c in _cap_show.columns:
+                                                        _cap_show[c] = _cap_show[c].round(3)
+                                                html_parts.append("<div class='note'><b>CAP means:</b> cat0/cat1/cat2 are mean θ for that observed category (per item).</div>")
+                                                html_parts.append(_df_to_html(_cap_show[[c for c in ['ACT','delta','infit_mnsq','PTMA','N_USED','cat0','cat1','cat2'] if c in _cap_show.columns]] if 'ACT' in _cap_show.columns else _cap_show, max_rows=26))
+                                                                                                # Figure 11.3 + Table 11.3: Testlet cluster plot (TCP) + membership table
+                                                try:
+                                                    if not locals().get('tcp_rendered', False):
+                                                        _q3_cut = float(_cfg_get('q3_cut', 0.20) or 0.20)
+                                                        _fig_tcp, _tbl_tcp = _draw_fig11_3_tcp(res, q3_cut=_q3_cut)
+                                                        if _fig_tcp is not None:
+                                                            html_parts.append("<h2>Figure 11.3 — Testlet cluster plot (TCP)</h2>")
+                                                            # Figure 11.3 captions
+                                                            _journal_cap = (
+                                                                "This testlet cluster plot (TCP) visualizes local dependence using a residual Q3 network and a relation-PCA layout. "
+                                                                "Vertices are sized by PTMA, and edges indicate the strength of residual associations (|Q3| above the chosen cutoff). "
+                                                                "PC axes summarize similarity in residual patterns, helping identify clusters consistent with testlet effects."
+                                                            )
+                                                            _teaching_cap = (
+                                                                "How to read this TCP: Each point is an item (vertex). Bigger points mean larger PTMA (typically stronger alignment with the latent measure). "
+                                                                "Lines connect item pairs whose residual correlation (Q3) exceeds the cutoff—thicker/denser connections imply stronger local dependence. "
+                                                                "The PC1–PC2 coordinates come from PCA on the residual-relationship structure, so items close together share similar residual patterns. "
+                                                                "Practical rule: look for tight groups with many strong Q3 links; if such a group also sits together in the PC space, it is a strong testlet candidate."
+                                                            )
+                                                            html_parts.append("<div class='note'><b>Journal caption:</b> " + _html.escape(_journal_cap) + "</div>")
+                                                            html_parts.append("<details style='margin:0.5em 0 0.8em 0'><summary><b>Report guide (how to examine this plot)</b></summary><div class='note' style='margin-top:0.5em'>" + _html.escape(_teaching_cap) + "</div></details>")
+                                                            html_parts.append(_plotly_plot(_fig_tcp, include_plotlyjs=False, output_type='div'))
+                                                        if _tbl_tcp is not None and len(_tbl_tcp):
+                                                            html_parts.append("<h3>Table 11.3 — Testlet membership + PTMA + Q3max</h3>")
+                                                            html_parts.append(_df_to_html(_tbl_tcp, max_rows=200))
+                                                        tcp_rendered = True
+                                                except Exception as _e_tcp:
+                                                    html_parts.append("<div class='note' style='color:#b00'>(Figure 11.3/Table 11.3 failed: " + _html.escape(repr(_e_tcp)) + ")</div>")
+
+                                                html_parts.append("""
+<div class='note' style='margin-top:0.8em'>
+<b>Visual diagnostic pattern (what you'll see in practice)</b><br><br>
+If you line up: <b>PTMA</b> + <b>Infit/Outfit</b> + <b>Residual Q3 matrix</b> + <b>Residual PCA</b>, you'll often see the following for <b>testlet items</b>:
+<ul>
+<li>PTMA: modest or uneven</li>
+<li>Infit: clustered &gt; 1.2</li>
+<li>Q3: strong positive links among themselves</li>
+<li>Residual PC1: dominated by those items</li>
+</ul>
+This is why <b>PTMA alone is not enough</b>, but it is a <b>necessary witness</b>.
+<hr style='margin:0.8em 0'>
+<b>Conceptual summary</b>: PTMA asks "Does this item move monotonically along theta?" Testlets answer: "Yes... but along our private little subdimension." When theta != testlet trait, PTMA suffers.
+<hr style='margin:0.8em 0'>
+<b>Practical rules</b>
+<table class='tbl'>
+<tr><th>Observation</th><th>Interpretation</th></tr>
+<tr><td>High loading + High Q3 + Normal PTMA</td><td>Mild LD</td></tr>
+<tr><td>High loading + High Q3 + Low PTMA</td><td><b>Serious LD</b></td></tr>
+<tr><td>Negative PTMA + High Q3</td><td>Testlet reversal / miscoding</td></tr>
+<tr><td>Good fit + Low PTMA</td><td>Secondary dimension</td></tr>
+</table>
+<b>One-sentence takeaway</b>: Under testlet effects, <b>PTMA is conservative</b> - it refuses to reward covariance that does not align with the Rasch latent trait, even when loadings look impressive.
+</div>
+""")
+                                                # [DEDUP] duplicate TCP/Table 11.3 block removed
+
+                                                # Annotation beneath Table 11.2: Visual diagnostic pattern
+                                                html_parts.append("""
+<div class='note' style='margin-top:0.8em'>
+<b>Visual diagnostic pattern (what you’ll see in practice)</b><br><br>
+If you line up: <b>PTMA</b> + <b>Infit/Outfit</b> + <b>Residual Q3 matrix</b> + <b>Residual PCA</b>, you’ll often see the following for <b>testlet items</b>:
+<ul>
+<li>PTMA: modest or uneven</li>
+<li>Infit: clustered &gt; 1.2</li>
+<li>Q3: strong positive links among themselves</li>
+<li>Residual PC1: dominated by those items</li>
+</ul>
+This is why <b>PTMA alone is not enough</b>, but it’s a <b>necessary witness</b>.
+<hr style='margin:0.8em 0'>
+<b>Practical rules</b>
+<table class='tbl'>
+<tr><th>Observation</th><th>Interpretation</th></tr>
+<tr><td>High loading + High Q3 + Normal PTMA</td><td>Mild LD</td></tr>
+<tr><td>High loading + High Q3 + Low PTMA</td><td><b>Serious LD</b></td></tr>
+<tr><td>Negative PTMA + High Q3</td><td>Testlet reversal / miscoding</td></tr>
+<tr><td>Good fit + Low PTMA</td><td>Secondary dimension</td></tr>
+</table>
+<b>One-sentence takeaway</b>: Under testlet effects, <b>PTMA is conservative</b> — it refuses to reward covariance that does not align with the Rasch latent trait, even when loadings look impressive.
+</div>
+""")
+
+                                        except Exception:
+                                            pass
+                                    except Exception as _e11_2:
+                                        html_parts.append("<div class='note' style='color:#b00'><b>Figure 11.2 CAP failed:</b> " + _html.escape(repr(_e11_2)) + "</div>")
+
                                 except Exception as _e11c:
                                     html_parts.append("<div class='note' style='color:#b00'><b>Figure 11 CPC failed:</b> " + _html.escape(repr(_e11c)) + "</div>")
 
@@ -3531,7 +4981,21 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                         # Using standardized residuals (ZSTD) like Figure 9, but for persons.
                         # -------------------------------------------------
                         try:
-                            fig13, _person_top20 = _person_dimension_plot_top20(res, top_n=20)
+                            # Beta (path coefficient) for persons: regress y~x where
+                            # x = mean(ZSTD) across items in Cluster 1 and y = mean(ZSTD) across items in Cluster 2.
+                            # Item clusters are defined by the sign of Contrast-1 loading (residual PCA; same as Figure 9).
+                            _beta13 = None
+                            _p_beta13 = None
+                            try:
+                                _Z13_full = getattr(res, 'debug', {}).get('ZSTD', None) if isinstance(getattr(res, 'debug', None), dict) else None
+                                _nodes_items13, _ = _build_item_vertices_relations_for_fig9(res)
+                                if _Z13_full is not None and _nodes_items13 is not None and 'cluster' in _nodes_items13.columns:
+                                    _beta13, _p_beta13, _ = _beta_p_from_zstd_clusters(_Z13_full, _nodes_items13['cluster'].to_numpy())
+                            except Exception:
+                                _beta13 = None
+                                _p_beta13 = None
+
+                            fig13, _person_top20 = _person_dimension_plot_top20(res, top_n=20, beta_value=_beta13, beta_p=_p_beta13)
                             if fig13 is not None:
                                 _note13 = None
                                 try:
@@ -3539,14 +5003,65 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                 except Exception:
                                     _note13 = None
                                 _safe_add_fig(html_parts, fig13, "Task 13 — Person dimension plot", note=_note13)
+
+                                # Beta annotation under the plot (explain what x/y mean; highlight beta+p)
+                                try:
+                                    _bnote13 = (
+                                        "<div class='note'>"
+                                        "<b>Beta (path coefficient)</b>: OLS slope for <i>y</i>~<i>x</i>, where "
+                                        "x = mean(ZSTD) across items in Cluster 1 and y = mean(ZSTD) across items in Cluster 2. "
+                                        "Clusters are defined by the sign of the <b>Contrast 1 loading</b> (residual PCA; same split used in Figure 9)."
+                                    )
+                                    if _beta13 is not None and _p_beta13 is not None:
+                                        _bnote13 += " &nbsp; <b style='color:#b00;font-size:22px'>Beta=%.2f, p=%.3g</b>" % (float(_beta13), float(_p_beta13))
+                                    _bnote13 += "</div>"
+                                    html_parts.append(_bnote13)
+                                except Exception:
+                                    pass
+                                # Figure 13b: 10-bin frequency histogram of |Q3| (persons; upper triangular)
+                                try:
+                                    _Z13 = getattr(res, 'debug', {}).get('ZSTD', None) if isinstance(getattr(res, 'debug', None), dict) else None
+                                    if _Z13 is not None:
+                                        _q13 = _q3_abs_from_zstd(_Z13, mode='persons')
+                                        _fig13b, _tab13b = _q3_hist10_figure(_q13, title='Figure 13b — |Q3| frequency (persons; upper triangular)')
+                                        if _fig13b is not None:
+                                            html_parts.append("<h3>Figure 13b — Residual correlation frequency (persons)</h3>")
+                                            html_parts.append(_plotly_plot(_fig13b, include_plotlyjs=False, output_type='div'))
+                                        if _tab13b is not None:
+                                            html_parts.append(_df_to_html(_tab13b, max_rows=10))
+                                except Exception as _e13b:
+                                    html_parts.append("<div class='note' style='color:#b00'>(Figure 13b failed: " + _html.escape(repr(_e13b)) + ")</div>")
+
                             if _person_top20 is not None and hasattr(_person_top20, "empty") and not _person_top20.empty:
+                                _cols13 = [c for c in ["Person","Loading","Theta","SS(i)","a(i)","b(i)"] if c in _person_top20.columns]
+                                if not _cols13:
+                                    _cols13 = list(_person_top20.columns)
                                 _safe_add_table(
                                     html_parts,
-                                    _person_top20[["Person","Loading","Theta","SS(i)","a(i)","b(i)"]],
+                                    _person_top20[_cols13],
                                     "Person list for Figure 13 (Top 20)",
                                     note=None,
                                     max_rows=50,
+
                                 )
+
+                            # -------------------------------------------------
+                            # Task 14: Plausible Values (PV) + Rubin's rules for group comparisons
+                            # -------------------------------------------------
+                            try:
+                                t141, t142, t14_note = _pv_rubin_group_compare(res, k=10)
+                                if t141 is not None and hasattr(t141, 'empty') and not t141.empty:
+                                    html_parts.append("<h2>Task 14 — Plausible Values (k=10) + Rubin's rules</h2>")
+                                    if t14_note:
+                                        html_parts.append("<div class='note'>" + _html.escape(str(t14_note)) + "</div>")
+                                    html_parts.append("<h3>Table 14.1 — Group means (PV pooled)</h3>")
+                                    html_parts.append(_df_to_html(t141, max_rows=100))
+                                if t142 is not None and hasattr(t142, 'empty') and not t142.empty:
+                                    html_parts.append("<h3>Table 14.2 — Group contrasts vs reference (PV pooled)</h3>")
+                                    html_parts.append(_df_to_html(t142, max_rows=200))
+                            except Exception as _e14:
+                                html_parts.append("<div class='note' style='color:#b00'>(Task 14 failed: " + _html.escape(repr(_e14)) + ")</div>")
+
                         except Exception as _e13:
                             html_parts.append("<pre>Figure 13 failed: %s</pre>" % _html.escape(repr(_e13)))
                 except Exception as _e:
@@ -3703,12 +5218,28 @@ def _render_scree_plot(eigs: np.ndarray, title: str) -> str:
     return fig.to_html(full_html=False, include_plotlyjs=False)
 
 def _get_response_matrix_for_pca(res):
-    # Prefer integer response matrix if present
-    X = res.debug.get("X_int", res.debug.get("X_obs", res.debug.get("X", None)))
+    """Response matrix used in PCA and downstream plots.
+
+    IMPORTANT: If the input data were continuous, we must use the transformed
+    categorical matrix (X_post / X_transformed / X_int / X0) for all post-analysis.
+    """
+    dbg = res.debug if isinstance(getattr(res, 'debug', None), dict) else {}
+    is_cont = bool(dbg.get('is_continuous_input', False))
+    X = None
+    if is_cont:
+        for k in ('X_post', 'X_transformed', 'X_int', 'X_obs', 'X0', 'X'):
+            v = dbg.get(k, None)
+            if v is not None:
+                X = v
+                break
+    else:
+        X = dbg.get('X_int', dbg.get('X_obs', dbg.get('X', None)))
+
     if X is None:
-        X = res.debug.get("X0", None)
+        X = dbg.get('X0', None)
         if X is not None:
-            X = np.asarray(X, dtype=float) + float(getattr(res, "min_cat", 0))
+            X = np.asarray(X, dtype=float) + float(getattr(res, 'min_cat', 0))
+
     return np.asarray(X, dtype=float) if X is not None else None
 
 def _get_standardized_residual_matrix(res):
@@ -4322,7 +5853,9 @@ def render_rumm2020_block(res, jitem: int = 1) -> str:
     for j in range(I):
         y = Z[:, j]
         m = _np.isfinite(y) & _np.isfinite(g2) & (strata>=0)
-        if m.sum() < 20:
+        # Need enough observations to populate 2 groups x 4 strata (8 cells) and a stable MS_error.
+        min_n = 12  # lowered from 20 to support small samples (e.g., nurse ratio n=19)
+        if m.sum() < min_n:
             dif_rows.append((j+1, items[j], _np.nan, _np.nan, _np.nan))
             continue
         yy = y[m]
@@ -4830,9 +6363,713 @@ def _draw_fig11_cpc(res, item_index_0):
     )
     return fig
 
-# ------------------------------
-# Task 12 (Winsteps-like DIF tables & forest plot)
-# ------------------------------
+
+def _draw_fig11_2_cap(res, x_min=-6, x_max=5, x_step=1):
+    """Figure 11.2: Winsteps Table 2.5 style Category Average Plot (CAP).
+
+    CAP means: cat0/cat1/... are mean θ for that observed category (per item).
+    - We fill missing cells with expected values first (per your rule), then map to
+      nearest category so that every person contributes to a category mean.
+    """
+    import numpy as _np
+    import pandas as _pd
+    import plotly.graph_objects as _go
+
+    item_df = getattr(res, 'item_df', None)
+    person_df = getattr(res, 'person_df', None)
+
+    if not isinstance(item_df, _pd.DataFrame) or len(item_df) == 0:
+        raise ValueError('CAP needs res.item_df')
+    if not isinstance(person_df, _pd.DataFrame) or len(person_df) == 0:
+        raise ValueError('CAP needs res.person_df')
+
+    # --- categories from fitted model ---
+    try:
+        min_cat = int(getattr(res, 'min_cat', 0))
+        max_cat = int(getattr(res, 'max_cat', 2))
+    except Exception:
+        min_cat, max_cat = 0, 2
+    if max_cat < min_cat:
+        min_cat, max_cat = 0, 2
+    cats = list(range(min_cat, max_cat + 1))
+
+    # --- Pull observed matrix + expected matrix (for filling missing) ---
+    dbg = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+    X_obs = None
+    for k in ('X_obs_filled', 'X_obs', 'X_post', 'X_transformed', 'X'):
+        if isinstance(dbg, dict) and k in dbg and dbg.get(k) is not None:
+            X_obs = dbg.get(k)
+            break
+    if X_obs is None:
+        X_obs = getattr(res, 'X_obs', None)
+
+    # Fallback: some pipelines only store shifted 0..K-1 matrix as X0.
+    # Convert back to observed scale by adding min_cat so CAP can still run.
+    if X_obs is None and isinstance(dbg, dict) and dbg.get('X0') is not None:
+        try:
+            X0 = _np.asarray(dbg.get('X0'), dtype=float)
+            if X0.ndim == 2:
+                X_obs = X0 + float(min_cat)
+                dbg['X_obs'] = X_obs.tolist()
+                try:
+                    setattr(res, 'debug', dbg)
+                except Exception:
+                    pass
+        except Exception:
+            X_obs = None
+
+    if X_obs is None:
+        raise ValueError('CAP needs res.X_obs (observed response matrix)')
+
+    EXP = None
+    if isinstance(dbg, dict):
+        EXP = dbg.get('EXP', None) or dbg.get('E_exp', None)
+
+    X = _np.asarray(X_obs, dtype=float)
+    if X.ndim != 2:
+        raise ValueError('res.X_obs must be a 2D matrix')
+
+    # --- align X to (persons x items) ---
+    if X.shape[0] != len(person_df) and X.shape[1] == len(person_df):
+        X = X.T
+    if X.shape[1] != len(item_df) and X.shape[0] == len(item_df):
+        X = X.T
+    if X.shape[0] != len(person_df):
+        raise ValueError(f'X_obs rows ({X.shape[0]}) do not match person_df ({len(person_df)})')
+    if X.shape[1] != len(item_df):
+        raise ValueError(f'X_obs cols ({X.shape[1]}) do not match item_df ({len(item_df)})')
+
+    # fill missing with expected value prior to CAP/Table 11.2
+    X_fill = X.copy()
+    if EXP is not None:
+        E = _np.asarray(EXP, dtype=float)
+        if E.ndim == 2:
+            if E.shape[0] != X_fill.shape[0] and E.shape[1] == X_fill.shape[0]:
+                E = E.T
+            if E.shape == X_fill.shape:
+                m = ~_np.isfinite(X_fill)
+                if m.any():
+                    X_fill[m] = E[m]
+
+    # map to nearest category (so filled expected values contribute)
+    X_cat = _np.rint(X_fill)
+    X_cat = _np.clip(X_cat, min_cat, max_cat)
+
+    # --- columns ---
+    act_col = 'ACT' if 'ACT' in item_df.columns else ('ITEM' if 'ITEM' in item_df.columns else None)
+    if act_col is None:
+        raise ValueError('CAP needs item_df with ACT/ITEM column')
+    delta_col = 'MEASURE' if 'MEASURE' in item_df.columns else ('DELTA' if 'DELTA' in item_df.columns else None)
+    if delta_col is None:
+        raise ValueError('CAP needs item_df with MEASURE (delta) column')
+    infit_col = 'INFIT_MNSQ' if 'INFIT_MNSQ' in item_df.columns else None
+
+    # person theta column
+    if 'theta' in person_df.columns:
+        theta_col = 'theta'
+    elif 'MEASURE' in person_df.columns:
+        theta_col = 'MEASURE'
+    else:
+        cand = [c for c in person_df.columns if c.lower() not in {'name','kid','person','id'}]
+        theta_col = cand[0] if cand else None
+    if theta_col is None:
+        raise ValueError('CAP needs person_df with theta/MEASURE column')
+
+    theta = _pd.to_numeric(person_df[theta_col], errors='coerce').to_numpy()
+
+    act = item_df[act_col].astype(str).to_list()
+    delta = _pd.to_numeric(item_df[delta_col], errors='coerce').to_numpy()
+    infit = _pd.to_numeric(item_df[infit_col], errors='coerce').to_numpy() if infit_col else _np.full(len(item_df), _np.nan)
+
+    # --- Compute mean theta per item per category ---
+    rows = []
+    for j in range(len(item_df)):
+        rj = X_cat[:, j]
+        for cat in cats:
+            m = (rj == cat) & _np.isfinite(theta)
+            mt = float(_np.nanmean(theta[m])) if m.sum() else _np.nan
+            rows.append({
+                'ACT': act[j],
+                'delta': float(delta[j]) if _np.isfinite(delta[j]) else _np.nan,
+                'infit_mnsq': float(infit[j]) if _np.isfinite(infit[j]) else _np.nan,
+                'cat': str(cat),
+                'mean_theta': mt,
+                'n': int(m.sum()),
+            })
+
+    cap_long = _pd.DataFrame(rows)
+
+    # --- Wide table (Table 11.2) ---
+    cap_item_df = (cap_long
+        .pivot_table(index=['ACT','delta','infit_mnsq'], columns='cat', values='mean_theta', aggfunc='first')
+        .reset_index())
+
+    # rename to cat0..catK in proper order
+    for c in [str(x) for x in cats]:
+        if c not in cap_item_df.columns:
+            cap_item_df[c] = _np.nan
+    for x in cats:
+        cap_item_df = cap_item_df.rename(columns={str(x): f'cat{x}'})
+
+    # Add PTMA to Table 11.2
+    try:
+        _ptma = compute_ptma_from_matrices(X_cat, theta, item_names=act, min_n=5)
+        if isinstance(_ptma, _pd.DataFrame) and 'ITEM' in _ptma.columns:
+            _ptma = _ptma.rename(columns={'ITEM':'ACT'})
+            cap_item_df = cap_item_df.merge(_ptma[['ACT','PTMA','N_USED']], on='ACT', how='left')
+    except Exception:
+        pass
+
+    # ensure PTMA columns exist even if merge failed
+    if 'PTMA' not in cap_item_df.columns:
+        cap_item_df['PTMA'] = _np.nan
+    if 'N_USED' not in cap_item_df.columns:
+        cap_item_df['N_USED'] = _np.nan
+
+    # Sort by delta descending like Winsteps
+    cap_item_df = cap_item_df.sort_values('delta', ascending=False, na_position='last').reset_index(drop=True)
+
+    # Reorder columns: ACT, delta, infit, PTMA, N_USED, cat*
+    cat_cols = [f'cat{x}' for x in cats]
+    keep = ['ACT','delta','infit_mnsq','PTMA','N_USED'] + cat_cols
+    cap_item_df = cap_item_df[[c for c in keep if c in cap_item_df.columns]].copy()
+
+    # --- build y labels for plot ---
+    def _fmt(v, nd=2):
+        try:
+            if _np.isfinite(v):
+                return f'{v:+.{nd}f}'
+        except Exception:
+            pass
+        return 'NA'
+
+    y_labels = []
+    for _, r in cap_item_df.iterrows():
+        y_labels.append(f"{r['ACT']}  (δ={_fmt(r['delta'],2)}, Infit={_fmt(r['infit_mnsq'],2).replace('+','')})")
+
+    label_map = dict(zip(cap_item_df['ACT'].astype(str).to_list(), y_labels))
+    cap_long['ACT_label'] = cap_long['ACT'].map(label_map).fillna(cap_long['ACT'])
+
+    # --- Plotly figure ---
+    fig = _go.Figure()
+
+    # Consistent colors across the whole report
+    palette = list(SPECIFIED_COLORS)
+    for idx, cat in enumerate([str(x) for x in cats]):
+        d = cap_long[cap_long['cat'] == cat]
+        fig.add_trace(_go.Scatter(
+            x=d['mean_theta'],
+            y=d['ACT_label'],
+            mode='markers+text',
+            text=[cat]*len(d),
+            textposition='middle right',
+            marker=dict(size=7, color=palette[idx % len(palette)]),
+            name=f"cat{cat}",
+            hovertemplate="cat%{text}<br>mean θ=%{x:.3f}<extra></extra>",
+        ))
+
+    # Winsteps Table 2.5 style "vertical" linkage:
+    # connect the same category (0/1/2/...) from top to bottom across items.
+    # (NOT left-to-right within each item.)
+    try:
+        # cap_item_df is already sorted by delta (top to bottom). Use that order.
+        # Important: do NOT "skip" missing categories when drawing lines.
+        # Skipping would connect non-adjacent items and creates confusing crossings.
+        # Instead, we insert breaks (None) so lines only connect consecutive items.
+        for idxc, xcat in enumerate(cats):
+            xs = []
+            ys = []
+            n_ok = 0
+            for _, r in cap_item_df.iterrows():
+                a = str(r.get('ACT', ''))
+                ylab = label_map.get(a, a)
+                v = r.get(f'cat{xcat}', _np.nan)
+                try:
+                    v = float(v)
+                except Exception:
+                    v = _np.nan
+                if _np.isfinite(v):
+                    xs.append(v)
+                    ys.append(ylab)
+                    n_ok += 1
+                else:
+                    # break the polyline at this item
+                    xs.append(None)
+                    ys.append(None)
+            if n_ok >= 2:
+                # Use the same palette color as the corresponding category dots.
+                # This makes it visually obvious that linkages are within-category.
+                line_col = palette[idxc % len(palette)] if palette else 'black'
+                fig.add_trace(_go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode='lines',
+                    line=dict(color=line_col, width=1),
+                    hoverinfo='skip',
+                    showlegend=False,
+                ))
+    except Exception:
+        pass
+
+    fig.update_layout(
+        title='CAP (Figure 11.2) — Observed average measures by category (Winsteps Table 2.5)',
+        xaxis_title='Person measure (θ, logit)',
+        yaxis_title='Item (sorted by delta)',
+        height=880,
+        margin=dict(l=340, r=40, t=80, b=60),
+        legend_title='Category'
+    )
+
+    # Ensure the y-axis follows the delta-sorted order (top = largest delta).
+    # Plotly categoryarray is applied bottom->top for y-axes, so we reverse.
+    try:
+        fig.update_yaxes(categoryorder='array', categoryarray=list(reversed(y_labels)))
+    except Exception:
+        pass
+
+
+
+    # x-axis range: if caller used defaults (-6..5), tighten to data range to reduce blank space
+    try:
+        _vals = cap_long['mean_theta'].to_numpy(dtype=float)
+        _vals = _vals[_np.isfinite(_vals)]
+        if _vals.size:
+            _mn = float(_np.min(_vals)); _mx = float(_np.max(_vals))
+            _pad = max(0.5, 0.10 * (_mx - _mn))
+            if float(x_min) == -6 and float(x_max) == 5:
+                x_min_use, x_max_use = _mn - _pad, _mx + _pad
+            else:
+                x_min_use, x_max_use = float(x_min), float(x_max)
+            fig.update_xaxes(range=[x_min_use, x_max_use], dtick=float(x_step))
+    except Exception:
+        pass
+
+    return fig, cap_item_df
+
+
+
+
+def _draw_fig11_3_tcp__old(res, q3_cut: float = 0.20):
+    """Figure 11.3: Testlet Cluster Plot (TCP) using residual Q3 network + relation-PCA layout.
+
+    Steps (Python port of your R script idea):
+    1) Residual matrix R = O - E (or ZSTD as fallback)
+    2) Q3 = cor(R) across items; diag set to 0
+    3) Edges where |Q3| >= q3_cut
+    4) Communities via Louvain (networkx.louvain_communities) with fallback to greedy modularity
+    5) Layout via relation PCA: eigen(Q3) -> PC1/PC2
+
+    Returns: (plotly_figure, testlet_table, q3_matrix)
+    """
+    import numpy as _np
+    import pandas as _pd
+    import plotly.graph_objects as _go
+
+    item_df = getattr(res, 'item_df', None)
+    if not isinstance(item_df, _pd.DataFrame) or len(item_df) == 0:
+        return None, None, None
+
+    dbg = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+
+    # --- residual matrix ---
+    R = None
+    X = dbg.get('X_obs_filled') or dbg.get('X_obs') or dbg.get('X0') or dbg.get('X')
+    E = dbg.get('E_exp') or dbg.get('EXP')
+    if X is not None and E is not None:
+        try:
+            X = _np.asarray(X, dtype=float)
+            E = _np.asarray(E, dtype=float)
+            if X.shape == E.shape:
+                R = X - E
+        except Exception:
+            R = None
+    if R is None:
+        Z = dbg.get('ZSTD', None)
+        if Z is not None:
+            try:
+                R = _np.asarray(Z, dtype=float)
+            except Exception:
+                R = None
+
+    if R is None or _np.asarray(R).ndim != 2:
+        return None, None, None
+
+    # align to persons x items
+    R = _np.asarray(R, dtype=float)
+    if R.shape[1] != len(item_df) and R.shape[0] == len(item_df):
+        R = R.T
+    if R.shape[1] != len(item_df):
+        return None, None, None
+
+    # --- Q3 matrix ---
+    Q3 = _np.corrcoef(_np.nan_to_num(R, nan=_np.nan), rowvar=False)
+    Q3 = _np.nan_to_num(Q3, nan=0.0, posinf=0.0, neginf=0.0)
+    _np.fill_diagonal(Q3, 0.0)
+
+    # store for downstream hovers
+    try:
+        if isinstance(dbg, dict):
+            dbg['Q3'] = Q3
+            res.debug = dbg
+    except Exception:
+        pass
+
+    I = Q3.shape[0]
+    names = (item_df['ITEM'].astype(str).to_list() if 'ITEM' in item_df.columns else [f'Item{i+1}' for i in range(I)])
+
+    # --- edge list ---
+    idx = _np.argwhere(_np.abs(Q3) >= float(q3_cut))
+    idx = idx[idx[:, 0] < idx[:, 1]]
+    if idx.size == 0:
+        # still return PCA scatter with no edges
+        edges = []
+    else:
+        edges = [(int(a), int(b), float(Q3[a, b])) for a, b in idx]
+
+    # --- communities ---
+    try:
+        import networkx as nx
+        G = nx.Graph()
+        G.add_nodes_from(range(I))
+        for a, b, r in edges:
+            G.add_edge(a, b, weight=abs(r), r=r)
+
+        memb = {i: 0 for i in range(I)}
+        if G.number_of_edges() > 0:
+            # prefer Louvain if available
+            if hasattr(nx.algorithms.community, 'louvain_communities'):
+                comms = nx.algorithms.community.louvain_communities(G, weight='weight', seed=123)
+            else:
+                comms = list(nx.algorithms.community.greedy_modularity_communities(G, weight='weight'))
+            for k, cset in enumerate(comms, start=1):
+                for i in cset:
+                    memb[int(i)] = k
+            # optional: set singletons to 0
+            from collections import Counter
+            cnt = Counter(memb.values())
+            for i in list(memb.keys()):
+                if memb[i] != 0 and cnt[memb[i]] == 1:
+                    memb[i] = 0
+        testlet = _np.array([memb[i] for i in range(I)], dtype=int)
+    except Exception:
+        testlet = _np.zeros(I, dtype=int)
+
+    testlet_df = _pd.DataFrame({'ITEM': names, 'TESTLET': testlet})
+
+    # --- relation PCA layout ---
+    try:
+        vals, vecs = _np.linalg.eigh(Q3)
+        order = _np.argsort(_np.abs(vals))[::-1]
+        vals = vals[order]
+        vecs = vecs[:, order]
+        pc1 = vecs[:, 0] * _np.sqrt(_np.abs(vals[0])) if vals.size > 0 else _np.zeros(I)
+        pc2 = vecs[:, 1] * _np.sqrt(_np.abs(vals[1])) if vals.size > 1 else _np.zeros(I)
+    except Exception:
+        pc1 = _np.zeros(I)
+        pc2 = _np.zeros(I)
+
+    # --- build plotly figure ---
+    fig = _go.Figure()
+
+    # edges
+    for a, b, r in edges:
+        fig.add_trace(_go.Scatter(
+            x=[pc1[a], pc1[b]],
+            y=[pc2[a], pc2[b]],
+            mode='lines',
+            line=dict(width=1),
+            opacity=0.35,
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+
+    # nodes
+    hover = []
+    for i in range(I):
+        # max |Q3| for node
+        qmax = float(_np.max(_np.abs(Q3[i, :]))) if I > 1 else 0.0
+        hover.append(f"{names[i]}<br>Testlet={int(testlet[i])}<br>Q3max={qmax:.3f}<br>PC1={pc1[i]:.3f}<br>PC2={pc2[i]:.3f}")
+
+    fig.add_trace(_go.Scatter(
+        x=pc1,
+        y=pc2,
+        mode='markers+text',
+        text=names,
+        textposition='top center',
+        hovertext=hover,
+        hoverinfo='text',
+        marker=dict(size=12, line=dict(width=1)),
+        name='Items'
+    ))
+
+    fig.update_layout(
+        title=f"Figure 11.3 — Testlet Cluster Plot (TCP): Q3 network (|Q3| ≥ {q3_cut}) with relation-PCA layout",
+        xaxis_title='Relation PCA 1',
+        yaxis_title='Relation PCA 2',
+        height=720,
+        margin=dict(l=40, r=20, t=70, b=50),
+    )
+
+    return fig, testlet_df, Q3
+
+
+
+
+
+
+
+def _draw_fig11_3_tcp(res, q3_cut: float = 0.20):
+    """Figure 11.3: Testlet cluster plot (TCP) from residual Q3.
+
+    Outputs:
+      - Figure 11.3: relation-PCA layout of the Q3 matrix, with edges for |Q3| >= q3_cut.
+      - Table 11.3: Item membership + PTMA + Q3max + suspected testlet flag.
+
+    Notes:
+      - Residuals use RESID = O - E from Rasch (preferred), otherwise ZSTD as fallback.
+      - Communities use Louvain if networkx provides it; otherwise greedy modularity.
+    """
+    import numpy as _np
+    import pandas as _pd
+    import plotly.graph_objects as _go
+
+    dbg = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+    item_df = getattr(res, 'item_df', None)
+    person_df = getattr(res, 'person_df', None)
+    if not isinstance(item_df, _pd.DataFrame) or len(item_df) == 0:
+        return None, None
+
+    # labels
+    if 'ACT' in item_df.columns:
+        labels = item_df['ACT'].astype(str).to_list()
+    elif 'ITEM' in item_df.columns:
+        labels = item_df['ITEM'].astype(str).to_list()
+    else:
+        labels = [f'Item{i+1}' for i in range(len(item_df))]
+
+    # residual matrix R (persons x items)
+    R = None
+    if isinstance(dbg, dict) and dbg.get('RESID') is not None:
+        try:
+            R = _np.asarray(dbg.get('RESID'), dtype=float)
+        except Exception:
+            R = None
+    if R is None:
+        Xobs = None
+        if isinstance(dbg, dict):
+            for k in ('X_obs_filled', 'X_obs', 'X_post', 'X_transformed', 'X0', 'X'):
+                if dbg.get(k) is not None:
+                    Xobs = dbg.get(k)
+                    break
+        EXP = dbg.get('EXP', None) or dbg.get('E_exp', None) if isinstance(dbg, dict) else None
+        if Xobs is not None and EXP is not None:
+            try:
+                R = _np.asarray(Xobs, dtype=float) - _np.asarray(EXP, dtype=float)
+            except Exception:
+                R = None
+    if R is None and isinstance(dbg, dict) and dbg.get('ZSTD') is not None:
+        try:
+            R = _np.asarray(dbg.get('ZSTD'), dtype=float)
+        except Exception:
+            R = None
+
+    if R is None or _np.asarray(R).ndim != 2:
+        return None, None
+
+    R = _np.asarray(R, dtype=float)
+    I = len(labels)
+    # align persons x items
+    if R.shape[1] != I and R.shape[0] == I:
+        R = R.T
+    if R.shape[1] != I:
+        return None, None
+
+    # Q3 (pairwise-complete)
+    Q3 = _pd.DataFrame(R, columns=labels).corr(method='pearson', min_periods=3).to_numpy(dtype=float)
+    Q3 = _np.nan_to_num(Q3, nan=0.0, posinf=0.0, neginf=0.0)
+    _np.fill_diagonal(Q3, 0.0)
+
+    # store for other plots/hover
+    try:
+        if isinstance(dbg, dict):
+            dbg['Q3'] = Q3
+            res.debug = dbg
+    except Exception:
+        pass
+
+    # edges
+    edges = []
+    for i in range(I):
+        for j in range(i+1, I):
+            w = float(Q3[i, j])
+            if abs(w) >= float(q3_cut):
+                edges.append((i, j, w))
+
+    # communities
+    testlet = _np.zeros(I, dtype=int)
+    if edges:
+        try:
+            import networkx as nx
+            G = nx.Graph()
+            G.add_nodes_from(range(I))
+            for i, j, w in edges:
+                G.add_edge(i, j, weight=abs(w), r=w)
+            if hasattr(nx.algorithms.community, 'louvain_communities'):
+                comms = nx.algorithms.community.louvain_communities(G, weight='weight', seed=123)
+            else:
+                comms = list(nx.algorithms.community.greedy_modularity_communities(G, weight='weight'))
+            for k, cset in enumerate(comms, start=1):
+                for v in cset:
+                    testlet[int(v)] = k
+            # singleton -> 0
+            from collections import Counter
+            cnt = Counter(testlet.tolist())
+            for idx in range(I):
+                if testlet[idx] != 0 and cnt.get(int(testlet[idx]), 0) <= 1:
+                    testlet[idx] = 0
+        except Exception:
+            # fallback: single community (non-singletons only)
+            for idx in range(I):
+                testlet[idx] = 1
+
+    # relation PCA layout (eigh)
+    try:
+        vals, vecs = _np.linalg.eigh(Q3)
+        order = _np.argsort(_np.abs(vals))[::-1]
+        vals = vals[order]
+        vecs = vecs[:, order]
+        pc1 = vecs[:, 0] * _np.sqrt(abs(vals[0])) if vals.size > 0 else _np.zeros(I)
+        pc2 = vecs[:, 1] * _np.sqrt(abs(vals[1])) if vals.size > 1 else _np.zeros(I)
+    except Exception:
+        pc1 = _np.arange(I, dtype=float)
+        pc2 = _np.zeros(I, dtype=float)
+
+    # PTMA (leave-one-out theta) for Table 11.3
+    ptma_map = {labels[i]: _np.nan for i in range(I)}
+    nused_map = {labels[i]: _np.nan for i in range(I)}
+    try:
+        # theta from person_df
+        theta = None
+        if isinstance(person_df, _pd.DataFrame) and len(person_df) > 0:
+            if 'theta' in person_df.columns:
+                theta = _pd.to_numeric(person_df['theta'], errors='coerce').to_numpy(dtype=float)
+            elif 'MEASURE' in person_df.columns:
+                theta = _pd.to_numeric(person_df['MEASURE'], errors='coerce').to_numpy(dtype=float)
+        # observed (filled) responses for PTMA categories
+        Xobs = None
+        if isinstance(dbg, dict):
+            for k in ('X_obs_filled', 'X_obs', 'X_post', 'X_transformed', 'X0', 'X'):
+                if dbg.get(k) is not None:
+                    Xobs = dbg.get(k)
+                    break
+        if theta is not None and Xobs is not None:
+            Xmat = _np.asarray(Xobs, dtype=float)
+            if Xmat.ndim == 2:
+                if Xmat.shape[1] != I and Xmat.shape[0] == I:
+                    Xmat = Xmat.T
+                # map to nearest category so decimals also work
+                try:
+                    min_cat = int(getattr(res, 'min_cat', 0))
+                    max_cat = int(getattr(res, 'max_cat', 2))
+                except Exception:
+                    min_cat, max_cat = 0, 2
+                Xcat = _np.rint(Xmat)
+                Xcat = _np.clip(Xcat, min_cat, max_cat)
+                _pt = compute_ptma_from_matrices(Xcat, theta, item_names=labels, min_n=5)
+                if isinstance(_pt, _pd.DataFrame) and len(_pt) > 0:
+                    # accept either ITEM or ACT column
+                    if 'ITEM' in _pt.columns:
+                        for _, r in _pt.iterrows():
+                            ptma_map[str(r['ITEM'])] = float(r.get('PTMA', _np.nan))
+                            nused_map[str(r['ITEM'])] = float(r.get('N_USED', _np.nan))
+                    elif 'ACT' in _pt.columns:
+                        for _, r in _pt.iterrows():
+                            ptma_map[str(r['ACT'])] = float(r.get('PTMA', _np.nan))
+                            nused_map[str(r['ACT'])] = float(r.get('N_USED', _np.nan))
+    except Exception:
+        pass
+
+    # node-level Q3max and suspected flag
+    q3max = _np.array([float(_np.max(_np.abs(Q3[i, :]))) if I > 1 else 0.0 for i in range(I)], dtype=float)
+    ptma_arr = _np.array([ptma_map.get(labels[i], _np.nan) for i in range(I)], dtype=float)
+    suspected = (q3max >= 0.10) & _np.isfinite(ptma_arr) & (ptma_arr < 0.10)
+
+    # Table 11.3
+    tbl = _pd.DataFrame({
+        'Item': labels,
+        'Testlet': testlet,
+        'PTMA': ptma_arr,
+        'N_USED': [_np.nan if not _np.isfinite(nused_map.get(labels[i], _np.nan)) else nused_map.get(labels[i], _np.nan) for i in range(I)],
+        'Q3max': q3max,
+        'Suspected_testlet': ['High Q3 + Low PTMA' if bool(suspected[i]) else '' for i in range(I)],
+        'PC1': pc1,
+        'PC2': pc2,
+    })
+
+    # Figure 11.3
+    fig = _go.Figure()
+    # edges
+    for i, j, w in edges:
+        fig.add_trace(_go.Scatter(
+            x=[pc1[i], pc1[j]],
+            y=[pc2[i], pc2[j]],
+            mode='lines',
+            line=dict(width=1),
+            opacity=0.35,
+            hoverinfo='skip',
+            showlegend=False,
+        ))
+
+    hover = []
+    for i in range(I):
+        h = f"{labels[i]}<br>Testlet={int(testlet[i])}<br>PTMA={ptma_arr[i]:.3f}" if _np.isfinite(ptma_arr[i]) else f"{labels[i]}<br>Testlet={int(testlet[i])}<br>PTMA=NA"
+        h += f"<br>Q3max={q3max[i]:.3f}"
+        if suspected[i]:
+            h += "<br><b>Suspected: High Q3 + Low PTMA</b>"
+        hover.append(h)
+
+    # Vertex size by PTMA (robust normalization).
+    # If any PTMA < 0, normalize by (PTMA - min)/(max - min) + 0.1 (as requested)
+    # so negatives still get a visible size. Otherwise we still use the same
+    # normalization for consistency.
+    sizes = _np.full(I, 12.0, dtype=float)
+    v = ptma_arr[_np.isfinite(ptma_arr)]
+    if v.size:
+        vmin = float(_np.min(v))
+        vmax = float(_np.max(v))
+        if vmax - vmin > 1e-12:
+            norm = (ptma_arr - vmin) / (vmax - vmin)
+            norm = norm + 0.1
+            norm = _np.where(_np.isfinite(norm), norm, 0.1)
+            # Map to a readable marker size range
+            sizes = 10.0 + 22.0 * _np.clip(norm, 0.0, 1.5)
+        else:
+            sizes = _np.full(I, 14.0, dtype=float)
+            sizes[~_np.isfinite(ptma_arr)] = 10.0
+    else:
+        sizes = _np.full(I, 12.0, dtype=float)
+
+    fig.add_trace(_go.Scatter(
+        x=pc1,
+        y=pc2,
+        mode='markers+text',
+        text=labels,
+        textposition='top center',
+        hovertext=hover,
+        hoverinfo='text',
+        marker=dict(size=sizes, line=dict(width=1)),
+        name='Items'
+    ))
+
+    fig.update_layout(
+        title=f"Figure 11.3 — TCP: Q3 network (|Q3| >= {float(q3_cut):.2f}) with relation-PCA layout",
+        xaxis_title='Relation PCA 1',
+        yaxis_title='Relation PCA 2',
+        height=720,
+        margin=dict(l=40, r=20, t=70, b=50),
+    )
+
+    return fig, tbl
 def _chi2_sf_df1(x: float) -> float:
     """Survival function for Chi-square with df=1 using erfc; avoids scipy dependency."""
     import math
@@ -5376,7 +7613,7 @@ def build_person_dimension_top20_table(person_df, Z_person, loading_pc1, cluster
 
 
 
-def _person_dimension_plot_top20(res, top_n=20):
+def _person_dimension_plot_top20(res, top_n=20, beta_value=None, beta_p=None):
     """Figure 13: Person dimension Kano-style plot (Top-N by |PC1| of ZSTD).
 
     - X axis: Theta (person measure)
@@ -5510,5 +7747,7 @@ def _person_dimension_plot_top20(res, top_n=20):
         y_col="value",
         x_label="Theta (person measure)",
         y_label="Contrast-1 loading",
+        beta_value=beta_value,
+        beta_p=beta_p,
     )
     return fig, tbl
