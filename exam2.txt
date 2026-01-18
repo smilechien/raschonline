@@ -1,0 +1,43 @@
+; This file is EXAM2.TXT
+ &INST
+ TITLE='KNOX CUBE TEST - ANCHORED'  ; the title for output
+ NI=18				; the number of items
+ ITEM1=11			; position of first response in data record
+ NAME1=1			; first column of person-id in data record
+ PERSON=KID			; label persons as "kids"
+ ITEM=TAP			; label items as "taps"
+ DATA=EXAM2DAT.TXT		; name of data file
+ CODES=01                       ; valid codes in the data
+ IAFILE=EXAM2IAF.TXT		; Item anchor file, same as next instructions
+ CONVERGE=L			; use only Logits for convergence criterion
+ LCONV=.005			; converged when biggest change is too small to show on any report.
+; IAFILE=*			; item anchor file list - COMMENTED OUT HERE
+;2 400				; item 2 anchored at 400 units
+;4 450				; item 4 anchored at 450 units
+;6 550				; item 6 anchored at 550 units
+;8 600				; item 8 anchored at 600 units
+; *
+ UIMEAN=500			; user scaling - item mean
+ USCALE=100			; user scaling - 1 logit = 100
+ UDECIM=0			; print measures without decimals
+ &END
+1-4				; item names
+2-3
+1-2-4
+1-3-4
+2-1-4
+3-4-1
+1-4-3-2
+1-4-2-3
+1-3-2-4
+2-4-3-1
+1-3-1-2-4
+1-3-2-4-3
+1-4-3-2-4
+1-4-2-3-4-1
+1-3-2-4-1-3
+1-4-2-3-1-4
+1-4-3-1-2-4
+4-1-3-4-2-1-4
+END NAMES
+; DATA IN A SEPARATE FILE
