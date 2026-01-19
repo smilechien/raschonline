@@ -1,0 +1,118 @@
+; This is file "example0.txt" - ";" starts a comment
+ &INST       ; this starts the control specifications; it is optional
+ TITLE = 'LIKING FOR SCIENCE (Wright & Masters p.18)'
+ NI    = 25  ; 25 items
+ ITEM1 = 1   ; responses start in column 1 of the data
+ NAME1 = 28  ; person-label starts in column 28 of the data
+ ITEM  = ACT ; items are called "activities"
+ PERSON= KID ; persons are called "kids"
+ CODES = 012 ; valid response codes (ratings) are 0, 1, 2
+ CLFILE=*    ; label the response categories
+ 0 Dislike   ; names of the reponse categories
+ 1 Neutral
+ 2 Like
+ *           ; "*" means the end of a list
+ @GENDER = $S1W1 ; KID gender in column 1 of person label
+ PSUBTOT = @GENDER ; subtotal by KIDs genders
+ &END        ; this ends the control specifications
+Watch birds ; These are brief descriptions of the 25 items
+Read books on animals
+Read books on plants
+Watch grass change
+Find bottles and cans
+Look up strange animal or plant
+Watch animal move
+Look in sidewalk cracks
+Learn weed names
+Listen to bird sing
+Find where animal lives
+Go to museum
+Grow garden
+Look at pictures of plants
+Read animal stories
+Make a map
+Watch what animals eat
+Go on picnic
+Go to zoo
+Watch bugs
+Watch bird make nest
+Find out what animals eat
+Watch a rat
+Find out what flowers live on
+Talk w/friends about plants
+END NAMES  ;this follows the item names: - the data follow:
+1211102012222021122021020  M Rossner, Marc Daniel
+2222222222222222222222222  M Rossner, Lawrence F.
+2211011012222122122121111  M Rossner, Toby G.   
+1010010122122111122021111  M Rossner, Michael T. 
+1010101001111001122111110  F Rossner, Rebecca A.
+1011211011121010122101210  M Rossner, Tr Cat
+2220022202222222222222222  M Wright, Benjamin
+2210021022222020122022022  M Lambert, Md., Ross W.
+0110100112122001121120211  M Schulz, Matthew
+2100010122221121122011021  M Hsieh, Daniel Seb
+2220011102222220222022022  M Hsieh, Paul Fred
+0100220101210011021000101  M Lieberman, Daniel
+1211000102121121122111000  M Lieberman, Benjamin
+2110020212022100022000120  F Hwa, Nancy Marie
+1111111111111111112211111  F Dyson, Stephie Nina
+2221121122222222222122022  F Buff, Marge Baby
+2222022222222222222222122  F Schattner, Gail
+2222021022222221222122022  M Ernst, Richard Max
+2221011002222211122020022  M Fontanilla, Hames
+1100010002122212122020022  M Anguiano, Rob
+1111011112122111122021011  M Eisen, Norm L.
+1211111112222121122121121  F Hogan, Kathleen
+2211112112222121222122122  M Vroom, Jeff
+1221012102222110122021022  F Tozer, Amy Elizabeth
+2221120222222221222122022  F Seiler, Karen
+1111111111111111111111111  M Neiman, Raymond
+1110011101122111022120221  M Denny, Don
+2211102002122121022012011  M Allen, Peter
+1000101001110000022110200  M Landman, Alan
+1000000002122000022012100  F Nordgren, Jan Swede
+2211011112221011122121111  M Sabile, Jack
+1210010011222110121022021  M Rossner, Jack
+2212021212222220222022021  F Rossner, Bess
+2222122222222222222222122  F Paster, Ruth
+1110211011122111122011111  M Rinzler, James
+1110201001122111122011111  M Amirault, Zippy
+1210010012122111122012021  M Airehead, John
+2211021112222121122222121  M Moose, Bullwinkle
+2221022112222122222122022  M Squrrel, Rocky J.
+2221011022222221222122022  M Badenov, Boris
+2222222222222222222222122  F Fatale, Natasha
+2121011112122221122011021  F Leader, Fearless
+2220112022222121222022021  M Man, Spider
+1210021012212211022011021  M Cianci, Buddy
+2221022222222222222222022  F Mcloughlin, Billy
+2200020002222000222122010  M Muller, Jeff
+1110220112212111022010000  M Van Dam, Andy
+2221022222222221222122022  M Chazelle, Bernie
+1100110101110112111111210  M Baudet, Gerard
+2222121222222222222122122  M Doeppner, Tom
+1210021022222221122021022  M Reiss, Steve
+1111111111111111122111111  M Stultz, Newell
+0100101010110011021010000  M Sabol, Andrew
+1111021121122112122021011  M Babboo, Baboo
+1010010011122112222111110  M Driskel, Michael
+2221012012222222222122022  M Eastwood, Clint
+2220022022222222222022022  F Clapp, Charlie
+1221010122222221222021021  F Clapp, Docent
+2221021122222221222022222  F Clapp, LB
+1221111122222121122121021  M Squilly, Michael
+2111010022122111122011022  M Squilly, Bay Of
+2220000022222220222020000  M Beiser, Ed
+1211010122222122222122010  M Becker, Selwin
+2210022112222121222122011  M Corleone, Vito
+1211211002222012122121200  M Corleone, Michael
+1201010012222120222022021  M Pinhead, Zippy
+1211001001212121222121012  F Malaprop, Mrs.
+1200010102120120022001010  M Bond, James
+1210010122222122222021021  M Blofeld, Villain
+2222022012222122222022021  M Kent, Clark
+2201222001220022220222201  M Stoller, Dave
+1001000100011010021200201  M Jackson, Solomon
+2012010122210201102202022  M Sandberg, Ryne
+2220022002222222222022012  M Patriarca, Ray
+1200110112122221022020010  M Pauling, Linus
