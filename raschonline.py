@@ -613,6 +613,15 @@ def kano_plot_aligned(
     df["a_i"] = pd.to_numeric(df_raw[_a_src], errors="coerce") if _a_src else np.nan
     df["b_i"] = pd.to_numeric(df_raw[_b_src], errors="coerce") if _b_src else np.nan
     df = df.dropna(subset=["x_val","y_val"])
+    # Ensure unique node names (required for edges mapping via set_index).
+    # If duplicates exist, aggregate to a single point per name (mean x/y/size; first cluster).
+    try:
+        if df["name"].duplicated().any():
+            df = (df.groupby("name", as_index=False)
+                    .agg({"cluster":"first", "x_val":"mean", "y_val":"mean", "size_val":"mean",
+                          "ss_i":"mean", "a_i":"mean", "b_i":"mean"}))
+    except Exception:
+        pass
     if df.empty:
         return go.Figure().update_layout(title="No numeric node data – cannot draw Dimension–Kano Map with Zscore residuals.")
 
@@ -1171,25 +1180,360 @@ class RaschResult:
 
 
 # --- CSV loader with encoding fallbacks (utf-8 / Big5) ---
+# --- CSV/TXT loader with encoding fallbacks (utf-8 / Big5) ---
 def _read_csv_robust(path: str):
-    """Read CSV with encoding fallbacks (utf-8-sig, utf-8, cp950, big5).
+    """Read CSV or supported TXT formats with encoding fallbacks.
 
-    This prevents UnicodeDecodeError for Traditional Chinese CSVs.
+    Supported:
+    - .csv: regular CSV/TSV
+    - .txt Winsteps control file ("&INST... END NAMES" + fixed-width records)
+    - .txt simple records without header:  <ID> <M/F> <digits...>  (or <digits...> <M/F> <ID>)
+
+    This prevents UnicodeDecodeError for Traditional Chinese CSVs and avoids
+    pandas ParserError on Winsteps control files.
     """
     import pandas as _pd
+    import numpy as _np
+    import re as _re
+    from io import StringIO
+    from pathlib import Path
+
+    def _read_text_any(enc: str):
+        b = Path(path).read_bytes()
+        return b.decode(enc, errors='replace')
+
+    def _looks_like_winsteps_control(txt: str) -> bool:
+        t = txt.upper()
+        return ('END NAMES' in t) and (('&INST' in t) or ('ITEM1' in t) or ('NI' in t))
+
+    def _parse_winsteps_control(txt: str):
+        """Parse a Winsteps control+data TXT (e.g., EXAM8.TXT).
+
+        Why this exists
+        ---------------
+        Winsteps sample files are often *not* CSV/TSV. They may contain an &INST
+        control block with parameters like NI=, CODES=, IREFER= and IVALUE*=
+        followed by fixed-format records after END NAMES.
+
+        This parser:
+        - Extracts control parameters (NI, CODES, IREFER, IVALUE*)
+        - Parses person records after END NAMES
+        - Applies IVALUE recoding when present
+        - Normalizes categories to consecutive 0..K-1 (missing preserved)
+        """
+        lines = txt.splitlines()
+
+        # --- 1) read control parameters before END NAMES ---
+        ctrl = {}
+        after = False
+        for ln in lines:
+            l0 = ln.strip()
+            if not after and l0.upper().startswith('END NAMES'):
+                after = True
+            if after:
+                continue
+
+            # drop comments after ';'
+            ln2 = ln.split(';', 1)[0].strip()
+            if not ln2:
+                continue
+            # accept either KEY=VAL or KEY VAL
+            m = _re.match(r"^([A-Za-z0-9_]+)\s*=\s*(.+)$", ln2)
+            if m:
+                k, v = m.group(1).upper(), m.group(2).strip()
+                ctrl[k] = v
+                continue
+            m = _re.match(r"^([A-Za-z0-9_]+)\s+(.+)$", ln2)
+            if m and ('&' not in m.group(1)):
+                k, v = m.group(1).upper(), m.group(2).strip()
+                # avoid overwriting if seen via '=' already
+                ctrl.setdefault(k, v)
+
+        # commonly used keys
+        try:
+            NI = int(str(ctrl.get('NI', '')).strip()) if str(ctrl.get('NI', '')).strip() else None
+        except Exception:
+            NI = None
+
+        CODES = str(ctrl.get('CODES', '')).strip()
+        if CODES:
+            # Winsteps examples sometimes put commas/spaces
+            CODES = ''.join([c for c in CODES if not c.isspace() and c != ','])
+        valid_codes = set(list(CODES)) if CODES else None
+
+        IREFER = str(ctrl.get('IREFER', '')).strip()
+        IREFER = ''.join([c for c in IREFER if not c.isspace()])
+
+        # collect IVALUE tables
+        ivalue_tables = {}
+        if IREFER:
+            for ch in set(IREFER):
+                key = f'IVALUE{ch.upper()}'
+                if key in ctrl:
+                    ivalue_tables[ch.upper()] = ''.join([c for c in str(ctrl[key]).strip() if not c.isspace()])
+
+        # --- 2) parse records after END NAMES ---
+        after = False
+        rec = []
+        # patterns:
+        #  a) DIGITS MF ID
+        #  b) ID MF DIGITS
+        pat_a = _re.compile(r"^\s*([0-9]{%d,})\s+([MFmf])\s+(.*?)\s*$" % (NI or 1))
+        pat_b = _re.compile(r"^\s*(.*?)\s+([MFmf])\s+([0-9]{%d,})\s*$" % (NI or 1))
+
+        for ln in lines:
+            if not after:
+                if ln.strip().upper().startswith('END NAMES'):
+                    after = True
+                continue
+            ln2 = ln.rstrip("\r\n")
+            if not ln2.strip():
+                continue
+            m = pat_a.match(ln2)
+            if m:
+                digits, mf, pid = m.group(1), m.group(2).upper(), m.group(3).strip()
+                rec.append((pid if pid else None, mf, digits.strip()))
+                continue
+            m = pat_b.match(ln2)
+            if m:
+                pid, mf, digits = m.group(1).strip(), m.group(2).upper(), m.group(3).strip()
+                rec.append((pid if pid else None, mf, digits.strip()))
+                continue
+
+        if not rec:
+            raise ValueError('Winsteps control file detected but no valid records found after END NAMES')
+
+        # Determine response string length
+        L = max(len(d) for _, _, d in rec)
+        if NI is not None:
+            L = int(NI)
+
+        rows = []
+        for pid, mf, digits in rec:
+            digits = digits.strip()
+            if len(digits) < L:
+                raise ValueError(f'Inconsistent response string length in Winsteps records: expected {L}, got {len(digits)}')
+            if len(digits) > L:
+                digits = digits[:L]
+
+            # raw codes as characters
+            raw = [ch for ch in digits]
+
+            # enforce CODES if provided
+            if valid_codes is not None:
+                raw = [ch if ch in valid_codes else '' for ch in raw]
+
+            # apply IVALUE recoding if present
+            recoded = []
+            if IREFER and ivalue_tables:
+                for j, ch in enumerate(raw, start=1):
+                    if not ch or (not ch.isdigit()):
+                        recoded.append(_np.nan)
+                        continue
+                    code = int(ch)
+                    ref = IREFER[j-1].upper() if (j-1) < len(IREFER) else ''
+                    table = ivalue_tables.get(ref, '')
+                    if table and 1 <= code <= len(table):
+                        newc = table[code-1]
+                        recoded.append(float(newc) if newc.isdigit() else _np.nan)
+                    else:
+                        recoded.append(float(code))
+            else:
+                for ch in raw:
+                    recoded.append(float(ch) if (ch and ch.isdigit()) else _np.nan)
+
+            rows.append([pid, 0 if mf == 'M' else 1] + recoded)
+
+        cols = ['ID', 'Profile'] + [f'I{i+1}' for i in range(L)]
+        df = _pd.DataFrame(rows, columns=cols)
+
+        # --- 3) normalize categories to consecutive 0..K-1 globally ---
+        X = df[[c for c in df.columns if _re.match(r'^I\d+$', str(c))]].to_numpy(dtype=float)
+        m = _np.isfinite(X)
+        vals = _np.unique(X[m])
+        if vals.size == 0:
+            raise ValueError('No finite response values found.')
+        vals = _np.sort(vals.astype(int))
+        mapping = {int(v): i for i, v in enumerate(vals)}
+        Xn = _np.full_like(X, _np.nan, dtype=float)
+        if m.any():
+            Xn[m] = _np.vectorize(mapping.get)(X[m].astype(int)).astype(float)
+        for j, c in enumerate([c for c in df.columns if _re.match(r'^I\d+$', str(c))]):
+            df[c] = Xn[:, j]
+
+        return df
+
+    def _parse_simple_records(txt: str):
+        # Accept records without headers.
+        # Supported patterns (one per line):
+        #   1) ID  MF  DIGITS
+        #   2) DIGITS  MF  ID
+        #   3) ID  DIGITS                (no MF)
+        #   4) DIGITS  ID                (no MF)
+        #   5) DIGITS                    (no ID/MF; auto-ID)
+        lines = [ln for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith(';')]
+        rec=[]
+        pat1 = _re.compile(r"^\s*(.*?)\s+([MFmf])\s+([0-9]{4,})\s*$")      # ID MF DIGITS
+        pat2 = _re.compile(r"^\s*([0-9]{4,})\s+([MFmf])\s+(.*?)\s*$")      # DIGITS MF ID
+        pat3 = _re.compile(r"^\s*(.*?)\s+([0-9]{4,})\s*$")                  # ID DIGITS
+        pat4 = _re.compile(r"^\s*([0-9]{4,})\s+(.*?)\s*$")                  # DIGITS ID
+        pat5 = _re.compile(r"^\s*([0-9]{4,})\s*$")                           # DIGITS only
+        for ln in lines:
+            m = pat1.match(ln)
+            if m:
+                pid = m.group(1).strip()
+                mf = m.group(2).upper()
+                digits = m.group(3)
+                rec.append((pid if pid else None, mf, digits))
+                continue
+            m = pat2.match(ln)
+            if m:
+                digits = m.group(1)
+                mf = m.group(2).upper()
+                pid = m.group(3).strip()
+                rec.append((pid if pid else None, mf, digits))
+                continue
+            m = pat3.match(ln)
+            if m:
+                pid = m.group(1).strip()
+                digits = m.group(2)
+                rec.append((pid if pid else None, None, digits))
+                continue
+            m = pat4.match(ln)
+            if m:
+                digits = m.group(1)
+                pid = m.group(2).strip()
+                rec.append((pid if pid else None, None, digits))
+                continue
+            m = pat5.match(ln)
+            if m:
+                digits = m.group(1)
+                rec.append((None, None, digits))
+                continue
+        if not rec:
+            # fall back to pandas (e.g., whitespace table)
+            return None
+
+        L = max(len(d) for _,_,d in rec)
+        rows=[]
+        auto_i = 0
+        for pid, mf, digits in rec:
+            digits = digits.strip()
+            if len(digits)!=L:
+                raise ValueError(f'Inconsistent response string length in text records: expected {L}, got {len(digits)}')
+            auto_i += 1
+            pid2 = pid if (pid is not None and str(pid).strip()!='') else f"P{auto_i:03d}"
+            # Profile is optional; if MF is absent, use NaN
+            if mf is None:
+                prof = _np.nan
+            else:
+                prof = 0 if mf=='M' else 1
+            rows.append([pid2, prof] + [int(ch) if ch.isdigit() else _np.nan for ch in digits])
+        cols=['ID','Profile'] + [f'I{i+1}' for i in range(L)]
+        return _pd.DataFrame(rows, columns=cols)
+
+    # --- Text-like special handling first (avoid pandas ParserError) ---
+    # IMPORTANT:
+    # Web uploads are sometimes saved to a temp filename WITHOUT the original extension.
+    # So we must NOT rely on file suffix alone. Instead we peek the content first.
+    _p_low = str(path).lower()
+
+    def _peek_text() -> str:
+        """Decode a small prefix of the file with a few common encodings."""
+        from pathlib import Path as _Path
+        b = _Path(path).read_bytes()
+        # Keep the full bytes for the real parse (Winsteps control may be long), but
+        # the peek is enough for routing.
+        for enc in ('utf-8', 'utf-8-sig', 'cp950', 'big5', 'latin1'):
+            try:
+                return b.decode(enc, errors='replace')
+            except Exception:
+                continue
+        return b.decode('utf-8', errors='replace')
+
+    # Content-based routing (works even if the extension is missing)
+    _peek = None
+    try:
+        _peek = _peek_text()
+    except Exception:
+        _peek = None
+
+    _looks_textlike = False
+    if _peek is not None:
+        t = _peek.strip()
+        if _looks_like_winsteps_control(t):
+            _looks_textlike = True
+        else:
+            # simple records: lines like "Richard M 1110..." OR "5536 M Richard"
+            sample = "\n".join([ln for ln in t.splitlines() if ln.strip()][:50])
+            if _re.search(r"\b[MFmf]\b", sample) and _re.search(r"\b\d{4,}\b", sample):
+                _looks_textlike = True
+
+    if _looks_textlike or _p_low.endswith(('.txt', '.dat', '.prn')):
+        # Try a couple of likely encodings
+        for enc in ('utf-8', 'utf-8-sig', 'cp950', 'big5', 'latin1'):
+            txt = _read_text_any(enc)
+            if _looks_like_winsteps_control(txt):
+                return _parse_winsteps_control(txt)
+            df2 = _parse_simple_records(txt)
+            if df2 is not None:
+                return df2
+        # If not matched, fall back to pandas table parsing with delimiter sniffing.
+        # Many users export "text" files that are actually CSV/TSV; whitespace-only parsing
+        # would collapse them into a single column and later cause "No item columns".
+        txt = None
+        try:
+            txt = _read_text_any('utf-8')
+        except Exception:
+            try:
+                txt = _read_text_any('latin1')
+            except Exception:
+                txt = None
+
+        if txt is not None:
+            # 1) Let python engine sniff delimiters
+            try:
+                df_try = _pd.read_csv(StringIO(txt), sep=None, engine='python')
+                if getattr(df_try, 'shape', (0, 0))[1] >= 2:
+                    return df_try
+            except Exception:
+                pass
+
+            # 2) Heuristics: if any line contains a clear delimiter, try it
+            sample_lines = [ln for ln in txt.splitlines() if ln.strip()][:50]
+            sample = "\n".join(sample_lines)
+            for sep in (',', '\t', ';'):
+                try:
+                    if sep in sample:
+                        df_try = _pd.read_csv(StringIO(txt), sep=sep, engine='python')
+                        if getattr(df_try, 'shape', (0, 0))[1] >= 2:
+                            return df_try
+                except Exception:
+                    continue
+
+            # 3) Finally: whitespace table
+            try:
+                df_try = _pd.read_csv(StringIO(txt), sep=r"\s+", engine='python')
+                return df_try
+            except Exception:
+                pass
+
+        # last resort: plain read_csv
+        return _pd.read_csv(path, sep=None, engine='python', on_bad_lines='skip')
+
+    # --- CSV/TSV ---
     encodings = ['utf-8-sig','utf-8','cp950','big5','latin1']
     last_err = None
     for enc in encodings:
         try:
-            return _pd.read_csv(path, encoding=enc)
+            return _pd.read_csv(path, encoding=enc, sep=None, engine='python', on_bad_lines='skip')
         except UnicodeDecodeError as e:
             last_err = e
             continue
     # final attempt: decode bytes with replacement
-    data = __import__("pathlib").Path(path).read_bytes()
+    data = Path(path).read_bytes()
     text = data.decode('utf-8', errors='replace')
-    from io import StringIO
-    return _pd.read_csv(StringIO(text))
+    return _pd.read_csv(StringIO(text), sep=None, engine='python', on_bad_lines='skip')
 def run_rasch(
     csv_path: str,
     id_col: Optional[str] = None,
@@ -1235,17 +1579,23 @@ def run_rasch(
     # Infer id column if not provided
     if id_col is None:
         first = df.columns[0]
-        # non-numeric first column -> treat as id
-        if not np.issubdtype(df[first].dtype, np.number):
+        # Treat first column as ID if it is non-numeric, OR if it is numeric but unique per row (e.g., 1..N).
+        try:
+            nunq_first = int(df[first].nunique(dropna=True))
+        except Exception:
+            nunq_first = 0
+        if (not np.issubdtype(df[first].dtype, np.number)) or (nunq_first == len(df)):
             id_col = first
 
     person_ids = df[id_col].astype(str).tolist() if id_col and id_col in df.columns else [f"P{i+1:03d}" for i in range(len(df))]
 
     # Preserve profile labels from input (for reporting / group Wright maps only; NOT used in estimation)
     profile_labels = None
-    for _cand in ["profile", "Profile", "PROFILE"]:
+    profile_source = None
+    for _cand in ["profile", "Profile", "PROFILE", "cluster", "Cluster", "TRUE_LABEL", "True_Label", "true_label"]:
         if _cand in df.columns:
             profile_labels = df[_cand].astype(str).fillna("NA").tolist()
+            profile_source = f"input:{_cand}"
             break
 
     use_df = df.copy()
@@ -1265,7 +1615,20 @@ def run_rasch(
 
     item_cols = list(use_df.columns)
     if not item_cols:
-        raise ValueError("No item columns found after dropping id/label columns.")
+        # Provide a helpful message for common user mistakes (e.g., uploading a Winsteps *output* report,
+        # or a delimiter-mismatched TXT that collapses into a single column).
+        try:
+            _shape = tuple(use_df.shape)
+            _cols = list(getattr(use_df, 'columns', []))
+        except Exception:
+            _shape, _cols = None, None
+        raise ValueError(
+            "No item columns found after dropping id/label columns. "
+            "This usually means the uploaded file was parsed as a single column (delimiter mismatch) "
+            "or it is not raw response data (e.g., a Winsteps output report). "
+            "Please upload a response matrix (rows=persons, cols=items) or a Winsteps data/control TXT. "
+            f"Parsed shape={_shape}, remaining_cols={_cols}"
+        )
 
     # Normalize common missing tokens (Winsteps-style): ".", "", "NA" -> NaN
     try:
@@ -1287,6 +1650,22 @@ def run_rasch(
 
     
 
+
+    # --- Guard: avoid mapping already-categorical 0/1 data into 0..4 by accidental continuous_transform ---
+    try:
+        _xf0 = X[np.isfinite(X)]
+        if _xf0.size:
+            _u0 = sorted(set([float(v) for v in _xf0.tolist()]))
+            if set(_u0).issubset({0.0, 1.0}) and continuous_transform is not None and int(max_category or 4) == 4:
+                # This is binary data; treat as categorical (no minmax scaling).
+                continuous_transform = None
+                # keep a breadcrumb for the report
+                try:
+                    kwargs.setdefault('_ct_guard', True)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     # --- Auto-detect continuous inputs ---
     # Rule (per your spec):
     #   if any finite value has decimals, or any finite value < 0, or any finite value > 10,
@@ -1343,14 +1722,23 @@ def run_rasch(
         else:
             raise ValueError(f"Unsupported continuous_transform: {continuous_transform}")
 
-    # If no profile in input, create a virtual binary profile by median split of raw total score
+    # If profile is missing (or constant), create a virtual binary profile (0/1) with a fixed seed.
+    # IMPORTANT: This is for grouped reporting only; NOT used in estimation.
     if profile_labels is None:
+        import numpy as _np
+        rng = _np.random.default_rng(20260119)
+        profile_labels = rng.integers(0, 2, size=X.shape[0]).astype(str).tolist()
+        profile_source = "auto_random_missing"
+    else:
         try:
-            _raw = np.nansum(X, axis=1)
-            _med = float(np.nanmedian(_raw))
-            profile_labels = np.where(_raw >= _med, "1", "0").astype(str).tolist()
+            _nunq = len(set([str(x) for x in profile_labels if str(x).lower() not in ("nan","none","na","")]))
         except Exception:
-            profile_labels = [str(i % 2) for i in range(X.shape[0])]
+            _nunq = 0
+        if _nunq <= 1:
+            import numpy as _np
+            rng = _np.random.default_rng(20260119)
+            profile_labels = rng.integers(0, 2, size=X.shape[0]).astype(str).tolist()
+            profile_source = "auto_random_constant"
 
 
     # store matrix for reliability (alpha) and debugging
@@ -1358,6 +1746,7 @@ def run_rasch(
         if "debug" not in locals():
             debug = {
         'profile': profile_labels,
+        'profile_source': profile_source,
 }
         debug["X"] = X.tolist()
         # Keep both raw and transformed matrices for diagnostics.
@@ -2117,7 +2506,7 @@ def export_cell_diagnostics(res, out_csv_path):
         last = None
         for enc in encs:
             try:
-                return _pd.read_csv(path, encoding=enc)
+                return _pd.read_csv(path, encoding=enc, sep=None, engine='python', on_bad_lines='skip')
             except UnicodeDecodeError as e:
                 last = e
                 continue
@@ -2676,6 +3065,297 @@ def _pv_rubin_group_compare(res, k: int = 10):
     return t141, t142, note
 
 
+def _person_ptma_proxy(res, X_obs=None):
+    # Proxy person PTMA: corr(person item responses, -item difficulty).
+    import numpy as _np
+    import pandas as _pd
+    try:
+        b = _np.asarray(getattr(res, 'b', None), dtype=float)
+    except Exception:
+        b = None
+    if b is None or b.size == 0:
+        try:
+            idf = getattr(res, 'item_df', None)
+            if isinstance(idf, _pd.DataFrame) and 'MEASURE' in idf.columns:
+                b = _pd.to_numeric(idf['MEASURE'], errors='coerce').to_numpy(dtype=float)
+        except Exception:
+            b = None
+    if b is None or b.size == 0:
+        return None
+
+    # observed matrix
+    X = None
+    if X_obs is not None:
+        X = _np.asarray(X_obs, dtype=float)
+    else:
+        dbg = getattr(res, 'debug', None)
+        if isinstance(dbg, dict) and 'X0' in dbg:
+            X = _np.asarray(dbg.get('X0'), dtype=float)
+        elif hasattr(res, 'X'):
+            try:
+                X = _np.asarray(res.X, dtype=float)
+            except Exception:
+                X = None
+    if X is None:
+        return None
+    # ensure shape (P,I)
+    if X.ndim != 2:
+        return None
+    if X.shape[1] != b.shape[0] and X.shape[0] == b.shape[0]:
+        X = X.T
+    if X.shape[1] != b.shape[0]:
+        return None
+
+    y = -b
+    out = _np.full(X.shape[0], _np.nan, dtype=float)
+    for p in range(X.shape[0]):
+        xp = X[p, :]
+        m = _np.isfinite(xp) & _np.isfinite(y)
+        if m.sum() < 3:
+            continue
+        xv = xp[m]
+        yv = y[m]
+        sx = _np.std(xv)
+        sy = _np.std(yv)
+        if sx <= 1e-12 or sy <= 1e-12:
+            continue
+        out[p] = float(_np.corrcoef(xv, yv)[0, 1])
+    return out
+
+
+def _kmeans3_labels(X2):
+    # tiny kmeans (k=3) for 2D features. Returns labels 1..3.
+    import numpy as _np
+    X = _np.asarray(X2, dtype=float)
+    m = _np.isfinite(X).all(axis=1)
+    if m.sum() < 6:
+        lab = _np.full(X.shape[0], 1, dtype=int)
+        return lab
+    Xm = X[m]
+    # init centroids by quantiles on first dimension
+    q = _np.nanquantile(Xm[:, 0], [0.2, 0.5, 0.8])
+    C = _np.vstack([
+        Xm[_np.argmin(_np.abs(Xm[:, 0] - q[0]))],
+        Xm[_np.argmin(_np.abs(Xm[:, 0] - q[1]))],
+        Xm[_np.argmin(_np.abs(Xm[:, 0] - q[2]))],
+    ])
+    for _ in range(50):
+        # assign
+        d2 = ((Xm[:, None, :] - C[None, :, :]) ** 2).sum(axis=2)
+        a = d2.argmin(axis=1)
+        C_new = C.copy()
+        for k in range(3):
+            if (a == k).sum() > 0:
+                C_new[k] = Xm[a == k].mean(axis=0)
+        if _np.allclose(C_new, C, atol=1e-6, rtol=0):
+            C = C_new
+            break
+        C = C_new
+    # full labels
+    lab_full = _np.full(X.shape[0], 1, dtype=int)
+    # order clusters by closeness to ideal fit (infit/outfit ~ 1)
+    ideal = _np.array([1.0, 1.0])
+    distC = ((C - ideal) ** 2).sum(axis=1)
+    order = _np.argsort(distC)  # 0=best fit
+    remap = {int(order[i]): i + 1 for i in range(3)}
+    lab_full[m] = _np.vectorize(lambda k: remap[int(k)])(a)
+    return lab_full
+
+
+def _pca_scores_2d(X2):
+    import numpy as _np
+    X = _np.asarray(X2, dtype=float)
+    mu = _np.nanmean(X, axis=0)
+    Xc = X - mu
+    # standardize
+    sd = _np.nanstd(Xc, axis=0)
+    sd = _np.where(sd > 1e-12, sd, 1.0)
+    Z = Xc / sd
+    # SVD
+    U, S, Vt = _np.linalg.svd(Z, full_matrices=False)
+    scores = U * S
+    return scores[:, :2], Vt[:2, :]
+
+
+def _task15_person_fit(res, top_n=100, k_nn=2):
+    import numpy as _np
+    import pandas as _pd
+    try:
+        import plotly.graph_objects as go
+        from plotly.offline import plot as _plotly_plot
+    except Exception:
+        return None, None, None, '(Task 15 skipped: plotly unavailable)'
+
+    pdf = getattr(res, 'person_df', None)
+    if not isinstance(pdf, _pd.DataFrame) or len(pdf) == 0:
+        return None, None, None, '(Task 15 skipped: person_df unavailable)'
+
+    # features
+    if 'INFIT_MNSQ' not in pdf.columns or 'OUTFIT_MNSQ' not in pdf.columns:
+        return None, None, None, '(Task 15 skipped: missing INFIT/OUTFIT in person_df)'
+
+    infit = _pd.to_numeric(pdf['INFIT_MNSQ'], errors='coerce').to_numpy(dtype=float)
+    outfit = _pd.to_numeric(pdf['OUTFIT_MNSQ'], errors='coerce').to_numpy(dtype=float)
+    theta = _pd.to_numeric(pdf.get('MEASURE', _np.nan), errors='coerce').to_numpy(dtype=float)
+
+    m = _np.isfinite(infit) & _np.isfinite(outfit)
+    if m.sum() < 5:
+        return None, None, None, '(Task 15 skipped: too few finite INFIT/OUTFIT)'
+
+    # compute fit classes on ALL persons with finite INFIT/OUTFIT (not just top-N)
+    X_all = _np.c_[infit[m], outfit[m]]
+    lab_m = _kmeans3_labels(X_all)
+    lab_all = _np.full(infit.shape[0], 1, dtype=int)
+    lab_all[m] = lab_m
+
+    # select top_n by misfit distance
+    mis = _np.sqrt((infit - 1.0) ** 2 + (outfit - 1.0) ** 2)
+    mis[~m] = -_np.inf
+    idx = _np.argsort(mis)[::-1]
+    idx = idx[:min(int(top_n), int((mis > -_np.inf).sum()))]
+    idx = idx[_np.isfinite(infit[idx]) & _np.isfinite(outfit[idx])]
+    if idx.size < 5:
+        return None, None, None, '(Task 15 skipped: insufficient top_n after filtering)'
+
+    X2 = _np.c_[infit[idx], outfit[idx]]
+    lab = lab_all[idx]
+    scores, _ = _pca_scores_2d(X2)
+    pc1 = scores[:, 0]
+    pc2 = scores[:, 1] if scores.shape[1] > 1 else _np.zeros_like(pc1)
+
+    # marker size by theta
+    th = theta[idx]
+    th_m = _np.isfinite(th)
+    if th_m.any():
+        q1, q9 = _np.nanquantile(th[th_m], 0.10), _np.nanquantile(th[th_m], 0.90)
+        if not _np.isfinite(q1) or not _np.isfinite(q9) or q9 <= q1:
+            sz = _np.full(idx.size, 12.0)
+        else:
+            th2 = _np.clip(th, q1, q9)
+            sz = 8.0 + (th2 - q1) / (q9 - q1) * (26.0 - 8.0)
+    else:
+        sz = _np.full(idx.size, 12.0)
+
+    kid = None
+    for c in ('KID','id','ID','Person','ENTRY'):
+        if c in pdf.columns:
+            kid = pdf.loc[idx, c].astype(str).to_numpy()
+            break
+    if kid is None:
+        kid = _np.asarray([str(i+1) for i in idx], dtype=object)
+
+    # edges using normalized euclidean distances in PCA space
+    P = idx.size
+    pts = _np.c_[pc1, pc2]
+    # distance matrix
+    D = _np.sqrt(((pts[:, None, :] - pts[None, :, :]) ** 2).sum(axis=2))
+    # normalize weights
+    d_non0 = D[D > 0]
+    if d_non0.size == 0:
+        dmin, dmax = 0.0, 1.0
+    else:
+        dmin, dmax = float(d_non0.min()), float(d_non0.max())
+        if dmax <= dmin:
+            dmax = dmin + 1.0
+
+    fig = go.Figure()
+    # add edges: k nearest neighbors per node
+    for i in range(P):
+        nn = _np.argsort(D[i, :])[1:1+int(max(1, k_nn))]
+        for j in nn:
+            dij = float(D[i, j])
+            w = (dmax - dij) / (dmax - dmin) if dmax > dmin else 0.0
+            w = float(_np.clip(w, 0.0, 1.0))
+            lw = 0.5 + 4.0 * w
+            fig.add_trace(go.Scatter(
+                x=[pc1[i], pc1[j]], y=[pc2[i], pc2[j]],
+                mode='lines',
+                line=dict(width=lw),
+                opacity=0.25,
+                hoverinfo='skip',
+                showlegend=False,
+            ))
+
+    # scatter (3 discrete classes)
+    custom = _np.stack([kid, X2[:,0], X2[:,1], th, lab], axis=1)
+
+    color_map = {1: 'red', 2: 'blue', 3: 'black'}
+    name_map = {1: 'Fit class 1', 2: 'Fit class 2', 3: 'Fit class 3'}
+
+    for cls in [1, 2, 3]:
+        mm = (lab == cls)
+        if not _np.any(mm):
+            continue
+        fig.add_trace(go.Scatter(
+            x=pc1[mm], y=pc2[mm], mode='markers',
+            marker=dict(size=sz[mm], color=color_map.get(int(cls), 'black'), opacity=0.9, line=dict(width=0.5)),
+            text=[str(k) for k in kid[mm]],
+            customdata=custom[mm],
+            hovertemplate=(
+                'Person=%{customdata[0]}'
+                '<br>INFIT=%{customdata[1]:.3f}  OUTFIT=%{customdata[2]:.3f}'
+                '<br>Measure=%{customdata[3]:.3f}'
+                '<br>Fit class=%{customdata[4]}'
+                '<extra></extra>'
+            ),
+            name=name_map.get(int(cls), f'Fit class {cls}'),
+            showlegend=True,
+        ))
+
+    fig.update_layout(
+        title='Figure 15 — Person fit type (PCA of Infit/Outfit; kmeans k=3)',
+        xaxis_title='PC1 (fit-pattern score)',
+        yaxis_title='PC2 (fit-pattern score)',
+        height=640,
+        margin=dict(l=60, r=20, t=80, b=60),
+    )
+
+    # output table for downloads
+    out = pdf.loc[idx].copy()
+    out['FIT_CLASS'] = lab
+    # strata cluster (alias)
+    out['STRATA_CLUSTER'] = lab
+    # person PTMA proxy
+    try:
+        ptma_p = _person_ptma_proxy(res)
+        if ptma_p is not None and len(ptma_p) == len(pdf):
+            out['PTMA'] = ptma_p[idx]
+    except Exception:
+        if 'PTMA' not in out.columns:
+            out['PTMA'] = _np.nan
+
+    keep_cols = []
+    for c in ['ENTRY','KID','profile','MEASURE','SE','INFIT_MNSQ','OUTFIT_MNSQ','INFIT_ZSTD','OUTFIT_ZSTD','PTMA','FIT_CLASS','STRATA_CLUSTER']:
+        if c in out.columns:
+            keep_cols.append(c)
+    out2 = out[keep_cols] if keep_cols else out
+
+    note = (
+        "Task 15: Fit classes are derived by kmeans(k=3) on (INFIT_MNSQ, OUTFIT_MNSQ). "
+        "The PCA coordinates (PC1, PC2) summarize similarity in fit patterns; points closer together have more similar fit. "
+        "Edges connect nearest neighbors in PCA space; line width is proportional to normalized neighbor similarity: w=(max-d)/(max-min). "
+        "Bubble size reflects person MEASURE (theta)."
+    )
+
+    return fig, out2, lab_all, note
+
+
+def _pv_rubin_fitclass_compare(res, fit_class, k=10):
+    import pandas as _pd
+    pdf = getattr(res, 'person_df', None)
+    if not isinstance(pdf, _pd.DataFrame) or len(pdf) == 0:
+        return None, None, '(Task 15 PV skipped: person_df unavailable)'
+    pdf2 = pdf.copy()
+    # Use a standard grouping column name so Task 14 grouping logic picks it up
+    pdf2['profile'] = [str(int(x)) for x in fit_class]
+    pdf2['fit_class'] = pdf2['profile']
+    # temporary res-like
+    class _Tmp: pass
+    tmp = _Tmp()
+    tmp.person_df = pdf2
+    return _pv_rubin_group_compare(tmp, k=int(k))
+
+
 
 
 def _q3_abs_from_zstd(Z, mode: str = "items"):
@@ -3039,12 +3719,15 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
       .tbl th{background:#f5f5f5}
       .pre{white-space:pre;overflow:auto;background:#f6f8fa;padding:12px;border-radius:10px}
       .note{color:#666;font-size:12px}
+      .warn{color:#b00020;font-weight:700}  /* Winsteps-style warning */
     </style>
     """
 
     plotly_js = "<script src='https://cdn.plot.ly/plotly-2.30.0.min.js'></script>"
 
     html_parts = []
+
+    kidmap_rendered = False  # used to keep Figure 8 in the right order
 
     body = ""  # ensure defined even if a later block is skipped
     html_parts.append(f"<div class='meta'><div><b>Rasch report</b></div>"
@@ -3056,6 +3739,123 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                       f"<div>Categories: {int(getattr(res,'min_cat',0))}..{int(getattr(res,'max_cat',0))}</div>"
                       f"<div>Step thresholds (tau): {tau_str} (max|tau|={tau_maxabs:.4f})</div>"
                       f"</div>")
+
+    # --- Category usage summary (counts / %) shown right under tau ---
+    try:
+        dbg0 = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+        X_used = None
+        for kk in ['X_int','X_obs','X','X_post']:
+            if kk in dbg0 and dbg0.get(kk) is not None:
+                try:
+                    X_used = np.asarray(dbg0.get(kk), dtype=float)
+                    break
+                except Exception:
+                    X_used = None
+        if X_used is not None:
+            vv = X_used[np.isfinite(X_used)].astype(float)
+            if vv.size:
+                cats = list(range(int(getattr(res,'min_cat',0)), int(getattr(res,'max_cat',0)) + 1))
+                total = float(vv.size)
+                rows=[]
+                for c in cats:
+                    cnt = int(np.sum(vv==float(c)))
+                    pct = 100.0*cnt/total if total else 0.0
+                    flag = '⚠ < 5%' if pct < 5.0 else 'OK'
+                    rows.append({'Category': c, 'Count': cnt, 'Percent (%)': round(pct,2), 'Flag': flag})
+                _cdf = _pd.DataFrame(rows)
+                html_parts.append('<h3>Category usage summary</h3>')
+                html_parts.append(_df_to_html(_cdf, max_rows=20))
+                html_parts.append("<div class='note'>Note: Categories with usage below 5% are commonly associated with disordered step thresholds in RSM.</div>")
+    except Exception as _e_cat:
+        html_parts.append("<div class='note'>(Category usage summary failed: " + _html.escape(repr(_e_cat)) + ")</div>")
+
+
+    # --- Profile preview (data sanity check) ---
+    try:
+        dbg = getattr(res, 'debug', {}) if isinstance(getattr(res, 'debug', None), dict) else {}
+        prof_series = None
+        prof_name = None
+
+        # Prefer explicit debug keys (if provided by data prep)
+        for k in ['Profile', 'profile', 'PROFILE', 'profile_labels', 'profile_raw', 'profile_vec']:
+            if k in dbg and dbg.get(k) is not None:
+                prof_series = dbg.get(k)
+                prof_name = k
+                break
+
+        # Fallback: person table profile column
+        if prof_series is None:
+            _pdf = getattr(res, 'person_df', None)
+            if _pdf is not None and hasattr(_pdf, 'columns') and 'profile' in _pdf.columns:
+                prof_series = _pdf['profile'].tolist()
+                prof_name = 'profile'
+
+        if prof_series is None:
+            html_parts.append(
+                "<div class='warn'>WARNING: Profile label not found in input/transformed data. "
+                "Expected a column named Profile/profile/cluster/True_Label (or M/F). "
+                "Group-based outputs (e.g., DIF-by-profile, grouped Wright maps) may be invalid.</div>"
+            )
+        else:
+            import numpy as _np
+            import pandas as _pd
+            s = _pd.Series(list(prof_series)).astype(str)
+            # Clean common missing tokens
+            s = s.replace({'nan': _np.nan, 'None': _np.nan, 'NA': _np.nan, '': _np.nan})
+            nunq = int(s.dropna().nunique())
+            n = int(len(s))
+            miss = int(s.isna().sum())
+            # show up to 3 unique labels (and first value as a concrete sanity check)
+            uniq = s.dropna().unique().tolist()
+            uniq_preview = uniq[:3]
+            first_val = s.dropna().iloc[0] if (s.dropna().shape[0] > 0) else ''
+
+            html_parts.append("<h3>Profile label check</h3>")
+            html_parts.append(
+                "<div class='note'>Profile source: <code>%s</code> &nbsp;|&nbsp; n=%d &nbsp;|&nbsp; unique=%d &nbsp;|&nbsp; missing=%d</div>" %
+                (_html.escape(str(prof_name)), n, nunq, miss)
+            )
+            html_parts.append(
+                "<div class='note'>Sample unique labels: <code>%s</code></div>" % _html.escape(', '.join([str(x) for x in uniq_preview]))
+            )
+            # For very long labels (like 1000100...), show the first 60 chars
+            if isinstance(first_val, str) and len(first_val) > 60:
+                first_show = first_val[:60] + '…'
+            else:
+                first_show = first_val
+            html_parts.append(
+                "<div class='note'>First non-missing Profile value: <code>%s</code></div>" % _html.escape(str(first_show))
+            )
+
+            # Winsteps-style warning when binary data accidentally mapped to 0..4
+            try:
+                min_cat = int(getattr(res, 'min_cat', 0))
+                max_cat = int(getattr(res, 'max_cat', 0))
+                X_used = None
+                for kk in ['X_int','X_obs','X','X0','X_post']:
+                    if kk in dbg and dbg.get(kk) is not None:
+                        X_used = _np.asarray(dbg.get(kk))
+                        break
+                if X_used is not None:
+                    vv = X_used[_np.isfinite(X_used)].astype(float)
+                    if vv.size > 0:
+                        u = sorted(set(vv.tolist()))
+                        if set(u).issubset({0.0,1.0}) and (min_cat==0 and max_cat==4):
+                            html_parts.append(
+                                "<div class='warn'>WARNING: Binary data detected, but 5-category mapping was applied—check continuous_transform.</div>"
+                            )
+            except Exception:
+                pass
+
+            # Warn if Profile is constant (often auto-filled or parsing failed)
+            if nunq <= 1:
+                html_parts.append(
+                    "<div class='warn'>WARNING: Profile has only one unique value. "
+                    "This often indicates that the profile column was missing or not parsed correctly, and a fallback profile was used.</div>"
+                )
+
+    except Exception as _e:
+        html_parts.append("<div class='note'>(Profile label check failed: " + _html.escape(repr(_e)) + ")</div>")
 
     # Winsteps summary block (text)
     if summary_pre:
@@ -3479,6 +4279,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
             ("expected_score.csv", "Expected scores (matrix)"),
             ("residual.csv", "Residuals (matrix)"),
             ("zscore.csv", "Z-scores (standardized residuals, matrix)"),
+            ("person_fit_type.csv", "Person fit type (Task 15)"),
         ]:
             html_parts.append(
                 f"<tr><td>{_html.escape(_label)}</td>"
@@ -3946,6 +4747,125 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                             beta_p=_p_beta9,
                         )
                         fig9_html = _plotly_plot(fig9, output_type='div', include_plotlyjs=False)
+                        # --- Figure 8 (KIDMAP) — ordered BEFORE Figure 9/11 ---
+                        try:
+                            if not kidmap_rendered:
+                                import numpy as _np
+                                import pandas as _pd
+                                import plotly.graph_objects as _go
+                                from plotly.subplots import make_subplots as _make_subplots
+
+                                pdf = getattr(res, "person_df", None)
+                                idf = getattr(res, "item_df", None)
+                                zmat = None
+                                try:
+                                    zmat = getattr(getattr(res, "debug", {}), "get", lambda k, d=None: d)("ZSTD", None)
+                                except Exception:
+                                    zmat = None
+
+                                if isinstance(pdf, _pd.DataFrame) and isinstance(idf, _pd.DataFrame) and len(pdf) and len(idf) and zmat is not None:
+                                    # choose kid
+                                    try:
+                                        kid_row_idx = int(kid_no) - 1
+                                    except Exception:
+                                        kid_row_idx = 0
+                                    kid_row_idx = max(0, min(kid_row_idx, len(pdf)-1))
+                                    krow = pdf.iloc[kid_row_idx]
+                                    k_id = str(krow.get('KID', f'KID_{kid_row_idx+1:03d}'))
+                                    k_measure = float(krow.get('MEASURE', _np.nan))
+                                    k_se = float(krow.get('SE', _np.nan))
+                                    k_infit = float(krow.get('INFIT_MNSQ', _np.nan))
+                                    k_outfit = float(krow.get('OUTFIT_MNSQ', _np.nan))
+
+                                    zmat_arr = _np.asarray(zmat, dtype=float)
+                                    item_meas = _np.asarray(idf.get('MEASURE', _np.nan), dtype=float)
+                                    if zmat_arr.ndim == 2 and 0 <= kid_row_idx < zmat_arr.shape[0] and zmat_arr.shape[1] == len(idf):
+                                        zrow = zmat_arr[kid_row_idx, :]
+                                        items = idf['ITEM'].astype(str).tolist() if ('ITEM' in idf.columns) else [f'Item{i+1}' for i in range(len(idf))]
+
+                                        good = _np.isfinite(zrow) & _np.isfinite(item_meas)
+                                        zrow2 = zrow[good]
+                                        y2 = item_meas[good]
+                                        items2 = [items[i] for i,g in enumerate(good) if g]
+
+                                        fig8 = _make_subplots(rows=1, cols=2, shared_yaxes=True, horizontal_spacing=0.0,
+                                                              column_widths=[0.42, 0.58], subplot_titles=('Persons (distribution)', 'KIDMAP (cell ZSTD)'))
+
+                                        # left: person distribution
+                                        thetas = _np.asarray(pdf.get('MEASURE', _np.nan), dtype=float)
+                                        thetas = thetas[_np.isfinite(thetas)]
+                                        if thetas.size:
+                                            hist, edges_h = _np.histogram(thetas, bins=24)
+                                            centers = (edges_h[:-1] + edges_h[1:]) / 2
+                                            fig8.add_trace(_go.Bar(x=hist, y=centers, orientation='h', opacity=0.6,
+                                                                   hovertemplate='Count: %{x}<br>Measure(logit): %{y:.2f}<extra></extra>'),
+                                                           row=1, col=1)
+
+                                        # highlight kid
+                                        if _np.isfinite(k_measure):
+                                            fig8.add_trace(_go.Scatter(x=[0], y=[k_measure], mode='markers',
+                                                                       marker=dict(size=10, color='red'),
+                                                                       hovertemplate=(f'KID={k_id}<br>Measure={k_measure:.2f}<br>SE={k_se:.2f}<br>INFIT={k_infit:.2f}<br>OUTFIT={k_outfit:.2f}<extra></extra>')),
+                                                           row=1, col=1)
+                                                                                        # 1SE lines (Winsteps-style): horizontal red dashed/dotted lines across right panel
+                                            try:
+                                                x0 = float(_np.nanmin(zrow2)) if len(zrow2) else -1.0
+                                                x1 = float(_np.nanmax(zrow2)) if len(zrow2) else  1.0
+                                            except Exception:
+                                                x0, x1 = -1.0, 1.0
+                                            # main measure line
+                                            fig8.add_shape(type='line', xref='x2', yref='y2', x0=x0, x1=x1, y0=k_measure, y1=k_measure,
+                                                           line=dict(color='red', width=2, dash='dash'))
+                                            if _np.isfinite(k_se) and k_se > 0:
+                                                fig8.add_shape(type='line', xref='x2', yref='y2', x0=x0, x1=x1, y0=k_measure + k_se, y1=k_measure + k_se,
+                                                               line=dict(color='red', width=2, dash='dot'))
+                                                fig8.add_shape(type='line', xref='x2', yref='y2', x0=x0, x1=x1, y0=k_measure - k_se, y1=k_measure - k_se,
+                                                               line=dict(color='red', width=2, dash='dot'))
+# right: bubbles (size by SE if available)
+                                        se_item = _np.asarray(idf.get('SE', _np.nan), dtype=float) if 'SE' in idf.columns else _np.full(len(idf), _np.nan)
+                                        se2 = se_item[good] if se_item.size==len(idf) else _np.full(len(zrow2), _np.nan)
+                                        msize = 10.0
+                                        try:
+                                            msize = 6.0 + 24.0 * (_np.nan_to_num(se2, nan=_np.nanmedian(se2)) / max(_np.nanmax(se2), 1e-9))
+                                        except Exception:
+                                            msize = 10.0
+
+                                        # right: bubbles (red if |ZSTD|>=2)
+                                        try:
+                                            _cols = ['red' if (abs(float(z)) >= 2.0) else 'rgba(0,150,136,0.75)' for z in zrow2]
+                                        except Exception:
+                                            _cols = 'rgba(0,150,136,0.75)'
+
+                                        fig8.add_trace(_go.Scatter(
+                                            x=zrow2, y=y2, mode='markers',
+                                            customdata=items2,
+                                            marker=dict(size=msize, opacity=0.8, color=_cols, line=dict(width=0.5, color='rgba(0,0,0,0.25)')),
+                                            hovertemplate='Item: %{customdata}<br>ZSTD: %{x:.2f}<br>Delta: %{y:.2f}<extra></extra>'
+                                        ), row=1, col=2)
+
+                                        # add Winsteps-style vertical cut lines at ZSTD = -2 and +2
+                                        for _x in (-2.0, 2.0):
+                                            fig8.add_shape(
+                                                type='line', xref='x2', yref='paper',
+                                                x0=_x, x1=_x, y0=0.0, y1=1.0,
+                                                line=dict(color='red', width=2, dash='dot')
+                                            )
+
+                                        fig8.update_xaxes(title_text='Count', row=1, col=1)
+                                        fig8.update_xaxes(title_text='ZSTD', row=1, col=2)
+                                        fig8.update_yaxes(title_text='Logit', row=1, col=1)
+                                        fig8.update_layout(title=f'KIDMAP (Figure 8) — {k_id} — Measure {k_measure:.2f} (SE {k_se:.2f})  INFIT {k_infit:.2f} OUTFIT {k_outfit:.2f}')
+
+                                        html_parts.append('<h2>KIDMAP (Figure 8)</h2>')
+                                        html_parts.append(_plotly_plot(fig8, include_plotlyjs=False, output_type='div'))
+                                        kidmap_rendered = True
+                                else:
+                                    # still mark so we don't duplicate in legacy block
+                                    kidmap_rendered = True
+                        except Exception as _e8:
+                            html_parts.append("<div class='note' style='color:#b00'>(Figure 8 KIDMAP failed: " + _html.escape(repr(_e8)) + ")</div>")
+                            kidmap_rendered = True
+
                         
                                                 # --- STANDARDIZED RESIDUAL variance table (Winsteps-style) shown above Figure 9 ---
                         try:
@@ -3957,7 +4877,12 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
     Raw Variance explained by items    =      15.0828  29.6%          29.5%
   Raw unexplained variance (total)     =      25.0000  49.1% 100.0%   49.3%
     Unexplned variance in 1st contrast =       4.6262   9.1%  18.5%"""
+                            # [DEDUP] Skip legacy misplaced KIDMAP block (Figure 8 rendered earlier).
+                            if locals().get('kidmap_rendered', False):
+                                raise RuntimeError('skip legacy kidmap')
+
                                                         # --- KIDMAP (Figure 8) [cell-ZSTD x-axis; logit y-axis; 1SE lines at kid measure; show grade] ---
+
                             try:
                                 import numpy as _np
                                 import plotly.graph_objects as _go
@@ -4105,7 +5030,6 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                                     x=zrow2, y=y2,
                                                     mode="markers",
                                                     marker=dict(size=_sizes, opacity=0.85),
-                                                    text=items2,
                                                     hovertemplate="ITEM=%{text}<br>cell ZSTD=%{x:.2f}<br>Item MEASURE(logit)=%{y:.2f}<br>Item SE=%{customdata:.2f}<extra></extra>",
                                                     customdata=se2,
                                                 ),
@@ -4730,7 +5654,16 @@ Total raw variance in observations     =      50.9521 100.0%         100.0%
                                         se = _np.sqrt(1.0/max(w, 1e-9))
                                         return float(b), float(se)
 
-                                    theta0 = th2[gmask0]; theta1 = th2[gmask1]
+                                    # Use theta from testlet refit (th2) when available; otherwise fall back to overall theta
+                                    theta_all = locals().get("th2", None)
+                                    if theta_all is None:
+                                        try:
+                                            theta_all = _np.asarray(getattr(res, "theta", None), dtype=float)
+                                        except Exception:
+                                            theta_all = None
+                                    if theta_all is None or getattr(theta_all, "ndim", 0) != 1:
+                                        raise ValueError("theta not available for DIF")
+                                    theta0 = theta_all[gmask0]; theta1 = theta_all[gmask1]
                                     dif_rows = []
                                     for j in range(I):
                                         xj0 = X02[gmask0, j]
@@ -5062,6 +5995,75 @@ This is why <b>PTMA alone is not enough</b>, but it’s a <b>necessary witness</
                             except Exception as _e14:
                                 html_parts.append("<div class='note' style='color:#b00'>(Task 14 failed: " + _html.escape(repr(_e14)) + ")</div>")
 
+
+
+                            # -------------------------------------------------
+                            # Task 15: Person fit type by kmeans(k=3) on INFIT/OUTFIT
+                            # Figure 15: PCA score network (top 100 persons)
+                            # and PV group comparison by fit class (Rubin's rules)
+                            # -------------------------------------------------
+                            try:
+                                fig15, tbl15, fit_cls15, note15 = _task15_person_fit(res, top_n=100, k_nn=2)
+                                if fig15 is not None:
+                                    html_parts.append("<h2>Task 15 — Person fit type by fitting Rasch model</h2>")
+                                    html_parts.append("<h3>Figure 15 — PCA score network (top 100 persons)</h3>")
+                                    if note15:
+                                        html_parts.append("<div class='note'>" + _html.escape(str(note15)) + "</div>")
+                                    html_parts.append(_plotly_plot(fig15, include_plotlyjs=False, output_type='div'))
+
+                                # export person list (PTMA + class + strata cluster)
+                                try:
+                                    if tbl15 is not None and hasattr(tbl15, 'empty') and not tbl15.empty:
+                                        # write CSV into run folder
+                                        _run_dir = getattr(res, 'run_dir', None)
+                                        if not _run_dir:
+                                            try:
+                                                _rid = getattr(res, 'run_id', None) or getattr(res, 'runid', None)
+                                                if _rid:
+                                                    _run_dir = str(_resolve_run_dir(str(_rid)))
+                                            except Exception:
+                                                _run_dir = None
+                                        if _run_dir:
+                                            from pathlib import Path as _Path
+                                            _p = _Path(str(_run_dir))
+                                            tbl15.to_csv(str(_p / 'person_fit_type.csv'), index=False, encoding='utf-8-sig')
+
+                                        html_parts.append("<h3>Person list for Figure 15 (Top 100)</h3>")
+                                        html_parts.append(_df_to_html(tbl15, max_rows=120))
+                                except Exception:
+                                    pass
+
+                                # PV group comparison by fit class (Rubin pooled)
+                                try:
+                                    if fit_cls15 is not None:
+                                        t151, t152, t15_note = _pv_rubin_fitclass_compare(res, fit_cls15, k=10)
+                                        if t151 is not None and hasattr(t151, 'empty') and not t151.empty:
+                                            html_parts.append("<h3>Task 15.2 — Class group comparison using PV (k=10) + Rubin's rules</h3>")
+                                            html_parts.append("<div class='note'>Groups are the kmeans-derived fit classes (1=best fit → 3=worst fit).</div>")
+                                            html_parts.append(_df_to_html(t151, max_rows=50))
+                                            html_parts.append("<div class='note'><b>How Task 15 is conducted:</b><ul>"
+                                                             "<li><b>Fit features</b>: use each person's INFIT_MNSQ and OUTFIT_MNSQ from the fitted Rasch model.</li>"
+                                                             "<li><b>k-means (k=3)</b>: cluster persons in the 2D (INFIT, OUTFIT) space; relabel clusters so Class 1 is closest to the ideal point (1,1) and Class 3 is farthest.</li>"
+                                                             "<li><b>PCA coordinates</b>: run PCA on (INFIT, OUTFIT) and plot PC1 vs PC2 to visualize similarity of fit patterns.</li>"
+                                                             "<li><b>Top-100 dashboard</b>: display only the top 100 persons with the largest misfit distance sqrt((INFIT-1)^2+(OUTFIT-1)^2); bubble size is proportional to person MEASURE.</li>"
+                                                             "<li><b>Edges</b>: connect each node to its k nearest neighbors in PCA space (k=2). Edge strength is normalized as w=(max-d)/(max-min), where d is Euclidean distance in the PCA plane; thicker edges indicate closer neighbors.</li>"
+                                                             "<li><b>PV group comparison</b>: generate k=10 plausible values PV ~ N(theta, SE^2) per person, compute class means and contrasts per imputation, then pool estimates using Rubin's rules.</li>"
+                                                             "</ul></div>")
+                                            html_parts.append("<div class='note'>"
+                                                              "<b>How Task 15.2 was conducted:</b> "
+                                                              "(i) Person fit classes were obtained by k-means clustering (k=3) on two person-fit indices, INFIT_MNSQ and OUTFIT_MNSQ, and the clusters were ordered so that Class 1 is closest to the ideal fit (1,1) and Class 3 is farthest. "
+                                                              "(ii) For plausible values (PV), k=10 imputations were generated for each person as PV_m ~ N(Measure, SE^2). "
+                                                              "(iii) Within each fit class, the PV mean was computed for each imputation and then pooled using Rubin’s rules to obtain the overall mean, total SE, 95% CI, and degrees of freedom. "
+                                                              "(iv) Contrasts were computed against Fit class 1 as the reference and pooled using the same Rubin framework."
+                                                              "</div>")
+                                        if t152 is not None and hasattr(t152, 'empty') and not t152.empty:
+                                            html_parts.append("<h4>Contrasts vs Fit class 1 (reference)</h4>")
+                                            html_parts.append(_df_to_html(t152, max_rows=100))
+                                except Exception as _e15pv:
+                                    html_parts.append("<div class='note' style='color:#b00'>(Task 15 PV failed: " + _html.escape(repr(_e15pv)) + ")</div>")
+
+                            except Exception as _e15:
+                                html_parts.append("<div class='note' style='color:#b00'>(Task 15 failed: " + _html.escape(repr(_e15)) + ")</div>")
                         except Exception as _e13:
                             html_parts.append("<pre>Figure 13 failed: %s</pre>" % _html.escape(repr(_e13)))
                 except Exception as _e:
@@ -6560,7 +7562,7 @@ def _draw_fig11_2_cap(res, x_min=-6, x_max=5, x_step=1):
         fig.add_trace(_go.Scatter(
             x=d['mean_theta'],
             y=d['ACT_label'],
-            mode='markers+text',
+            mode='markers',
             text=[cat]*len(d),
             textposition='middle right',
             marker=dict(size=7, color=palette[idx % len(palette)]),
@@ -6793,10 +7795,8 @@ def _draw_fig11_3_tcp__old(res, q3_cut: float = 0.20):
     fig.add_trace(_go.Scatter(
         x=pc1,
         y=pc2,
-        mode='markers+text',
-        text=names,
-        textposition='top center',
-        hovertext=hover,
+        mode='markers',
+        text=names,        hovertext=hover,
         hoverinfo='text',
         marker=dict(size=12, line=dict(width=1)),
         name='Items'
@@ -7052,10 +8052,8 @@ def _draw_fig11_3_tcp(res, q3_cut: float = 0.20):
     fig.add_trace(_go.Scatter(
         x=pc1,
         y=pc2,
-        mode='markers+text',
-        text=labels,
-        textposition='top center',
-        hovertext=hover,
+        mode='markers',
+        text=labels,        hovertext=hover,
         hoverinfo='text',
         marker=dict(size=sizes, line=dict(width=1)),
         name='Items'
