@@ -158,6 +158,21 @@ A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
         </select>
       </label>
 
+      <label style="display:flex;flex-direction:column;gap:6px;min-width:260px;">
+        <span style="font-size:12px;opacity:.8;">Model (Rasch family)</span>
+        <select name="irt_model" id="irtModelSel">
+          <option value="auto" selected>Auto (recommended)</option>
+          <option value="rsm">(1) RSM (includes dichotomous Rasch)</option>
+          <option value="pcm">(2) PCM (polytomous allowed)</option>
+          <option value="testlet_rsm">(3) Testlet Rasch for RSM</option>
+          <option value="testlet_pcm">(4) Testlet Rasch for PCM</option>
+        </select>
+        <span class="muted" style="font-size:12px;">
+          “Testlet” uses Q3 → communities and can (optionally) estimate per-person testlet effects τ.
+        <span id="irtModelHint" class="muted" style="font-size:12px; color:#8a2be2; display:none;"></span>
+        </span>
+      </label>
+
       <label style="display:flex;flex-direction:column;gap:6px;min-width:220px;" id="tamModelWrap">
         <span style="font-size:12px;opacity:.8;">TAM model</span>
         <select name="tam_model">
@@ -199,7 +214,7 @@ A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
 
   <p class="muted">
       Authors:
-      <br/>• Tsair-Wei Chien, Wen-Chung Wang</b>
+      <br/>• Tsair-Wei Chien, Shao Yang, Willy Chou, Wen-Chung Wang*</b>
       <br/>• <a href="https://youtu.be/vvi27MqIxLs">MP4 video</a>
     </p>
 
@@ -209,7 +224,31 @@ A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
       <br/>• The report includes <b>Person(NON-EXTREME)</b> and <b>Item(NON-EXTREME)</b> summaries (like your ASP tail).
       <br/>• “NON-EXTREME” excludes persons/items with raw score = 0 or raw score = max valid count.
     </p>
-  
+  <!-- ===== Notice: Concept source & recommended learning path ===== -->
+<details class="readme-section" open style="margin-top:14px;">
+  <summary style="cursor:pointer;font-weight:700;"><font color=red>Notice: Concept source & recommended learning path</font></summary>
+  <div style="margin-top:10px;line-height:1.55;">
+    <p>
+      <b>RaschOnline</b> (a 3-Step All-in-One Web-Based Rasch Analysis App for the Rating Scale Model, RSM)
+      is conceptually inspired by the workflow and reporting style commonly used in
+      <b>WINSTEPS</b>.
+      RaschOnline enables users to conduct complete RSM analyses through a simple, browser-based
+      copy-and-paste workflow for learning and quick exploration.
+    </p>
+
+    <p>
+      For <b>advanced learning</b>, deeper diagnostics, and comprehensive professional use,
+      users are <font color=red>strongly recommended to use the fully featured <b>WINSTEPS</b> software </font> after they
+      acquire foundational understanding of Rasch analysis via RaschOnline.
+    </p>
+
+    <p style="opacity:.85;">
+      <i>Note:</i> RaschOnline is intended as a learning- and accessibility-oriented tool and does not replace
+      professional-grade Rasch software for all advanced use cases.
+    </p>
+  </div>
+</details>
+
     <hr />
     <h3>ReadMe (Concise)</h3>
 <hr />
@@ -243,8 +282,43 @@ A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
   <b>Try without data:</b> Click <b>Run demo</b> to generate a full dashboard instantly, or download the demo CSV and run it locally.
 </p>
 
+<details style="margin-top:14px;" open>
+  <summary style="cursor:pointer;font-weight:800;">Methods</summary>
+  <div class="muted" style="margin-top:10px;">
+    <p><b>Model selection and data handling.</b> This app implements Rasch-family models under a unified workflow with automatic data-type detection. Dichotomous (0/1) data are analyzed using the Rasch model. Polytomous data can be analyzed using the Rating Scale Model (RSM) or the Partial Credit Model (PCM). Continuous, negative, or large-valued numeric inputs are automatically transformed into an ordinal rating scale (default 0–4) prior to Rasch analysis.</p>
+    <p><b>Testlet (local dependence) diagnostics.</b> Local dependence is evaluated using residual-based diagnostics including Yen’s Q3 and residual correlation structures. Items with excess residual dependence are represented as a network (edges = substantial |Q3|), and communities in this network define candidate testlets.</p>
+    <p><b>Testlet modeling strategy.</b> When a testlet option is selected, the system first detects testlets (Q3 → communities). It can then optionally incorporate per-person testlet effects (τ) to absorb shared residual variance while preserving a single primary latent trait.</p>
+  </div>
+</details>
+
+<details style="margin-top:10px;">
+  <summary style="cursor:pointer;font-weight:800;">Limitations</summary>
+  <div class="muted" style="margin-top:10px;">
+    <p><b>PCM vs RSM in the Python engine.</b> When the Python engine is used, polytomous estimation uses a <b>shared-step</b> parameterization. Therefore, any “PCM” option in the Python engine is mathematically <b>RSM-style</b> (shared steps), not a true PCM with item-specific step parameters. Users requiring true PCM (and true PCM testlet) estimation should use the TAM (MML) engine.</p>
+    <p><b>Testlet estimation stability.</b> Testlet-effect estimation under joint maximum likelihood (JML) is more sensitive to extreme response patterns, small samples, and sparse testlets. Testlet outputs should be interpreted primarily as a correction for local dependence rather than substantive parameters.</p>
+    <p><b>Ordinal transformation.</b> Automatic transformation of continuous or irregular numeric inputs into ordinal categories enables Rasch modeling but may reduce information. Users should judge whether this transformation is substantively appropriate.</p>
+    <p><b>Content interpretation.</b> Testlets are detected empirically from residual dependence. Substantive interpretation should be guided by item content and theory, not statistical criteria alone.</p>
+  </div>
+</details>
 
   </div>
+<section id="pv-vs-person-measure" class="note-block">
+  <h3>Plausible Values (PV) vs. Mean Person Measure (Group-Level Interpretation)</h3>
+  <p>
+    In group-level analyses under the Rasch model, the average person measure and the pooled plausible value (PV) mean are
+    often numerically similar. This similarity arises because both quantities are centered on the same posterior ability
+    distribution.
+  </p>
+  <p>
+    However, their associated standard errors differ substantially. While the standard error of the mean person measure
+    ignores measurement uncertainty, the PV-based standard error incorporates both within- and between-imputation variance
+    via Rubin’s rules.
+  </p>
+  <p>
+    Consequently, PV-based group comparisons provide statistically valid inference and should be preferred for hypothesis
+    testing.
+  </p>
+</section>
 
 <script>
   const frm = document.getElementById('frm');
@@ -314,14 +388,39 @@ A05,1,0,1,0,1,0,1,0,0,1,1,1,1,0,0,1,1,2,2,1,1,1,1,1,0,0</pre>
   // Toggle TAM options
   const engineSel = document.getElementById('engineSel');
   const tamWrap = document.getElementById('tamModelWrap');
+
+
+  // Model hint: clarify PCM/shared-step approximation in Python engine
+  const irtModelSel = document.getElementById('irtModelSel');
+  const irtHint = document.getElementById('irtModelHint');
+  function syncIrtModelHint(){
+    if (!irtModelSel || !irtHint) return;
+    const eng = (engineSel && engineSel.value) ? engineSel.value : 'python';
+    const m = (irtModelSel.value || 'auto').toLowerCase();
+    const needsNote = (eng === 'python') && (m === 'pcm' || m === 'testlet_pcm');
+    if (needsNote){
+      irtHint.style.display = 'block';
+      irtHint.textContent = 'Note: In Python engine, polytomous “PCM” uses shared-step (RSM-style) approximation. Use TAM engine for true PCM / true PCM testlet.';
+    } else {
+      irtHint.style.display = 'none';
+      irtHint.textContent = '';
+    }
+  }
+
   function syncEngineUI(){
     const isTam = (engineSel && engineSel.value === 'tam');
     if (tamWrap) tamWrap.style.display = isTam ? 'flex' : 'none';
   }
   if (engineSel){
-    engineSel.addEventListener('change', syncEngineUI);
+    engineSel.addEventListener('change', () => { syncEngineUI(); syncIrtModelHint(); });
     syncEngineUI();
+    syncIrtModelHint();
   }
+  if (irtModelSel){
+    irtModelSel.addEventListener('change', syncIrtModelHint);
+    syncIrtModelHint();
+  }
+
 </script>
 <!-- ========== Floating contact button + modal ========== -->
 <button
