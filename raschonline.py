@@ -639,6 +639,13 @@ def kano_plot_aligned(
         _flipped = True
 
     mean_x = float(df["x_val"].mean()); mean_y = float(df["y_val"].mean())
+
+    # For residual-contrast loading plots (Figures 9/9.2/14), the natural reference is loading = 0.
+    # Force the horizontal centerline to be exactly at y=0 so the red dotted line aligns with 0.
+    _yl = (y_label or y_col or "")
+    _force_zero_y = ("contrast" in _yl.lower()) or ("loading" in _yl.lower())
+    if _force_zero_y:
+        mean_y = 0.0
     min_x, max_x = float(df["x_val"].min()), float(df["x_val"].max())
     min_y, max_y = float(df["y_val"].min()), float(df["y_val"].max())
 
@@ -647,6 +654,13 @@ def kano_plot_aligned(
     x_low, x_high = min_x-expand_x, max_x+expand_x
     y_low, y_high = min_y-expand_y, max_y+expand_y
     x_span, y_span = x_high-x_low, y_high-y_low
+
+    # Ensure y=0 is visible when we force the zero-loading reference.
+    if _force_zero_y:
+        pad = abs(expand_y) if np.isfinite(expand_y) else 1.0
+        y_low = min(y_low, 0.0 - pad)
+        y_high = max(y_high, 0.0 + pad)
+        y_span = y_high - y_low
 
     t = np.linspace(0.0, 1.0, 300)
     spread_x = (max_x-min_x)*0.43 if max_x>min_x else 1.0
@@ -694,7 +708,12 @@ def kano_plot_aligned(
     fig.add_trace(go.Scatter(x=lower_x,y=lower_y,mode="lines",line=dict(color="blue",width=2.5),hoverinfo="skip",name="Lower Kano curve"))
     fig.add_trace(go.Scatter(x=upper_x,y=upper_y,mode="lines",line=dict(color="blue",width=2.5),hoverinfo="skip",name="Upper Kano curve"))
     fig.add_trace(go.Scatter(x=circle_x,y=circle_y,mode="lines",line=dict(color="purple",width=2.0),hoverinfo="skip",name="Kano boundary"))
-    fig.add_trace(go.Scatter(x=[x_low,x_high],y=[mean_y,mean_y],mode="lines",line=dict(color="red",width=2.0,dash="dot"),hoverinfo="skip",name="Center horizontal"))
+    fig.add_trace(go.Scatter(
+        x=[x_low, x_high], y=[mean_y, mean_y], mode="lines",
+        line=dict(color="red", width=2.0, dash="dot"),
+        hoverinfo="skip",
+        name="Center horizontal" if not _force_zero_y else "Zero loading (y=0)",
+    ))
     fig.add_trace(go.Scatter(x=[mean_x,mean_x],y=[y_low,y_high],mode="lines",line=dict(color="red",width=2.0,dash="dot"),hoverinfo="skip",name="Center vertical"))
     # Two blue dotted control lines for Figure 9:
     # thr = min( max(|loading|) in each cluster ), draw y = ±thr
@@ -3356,6 +3375,219 @@ def _pv_rubin_fitclass_compare(res, fit_class, k=10):
     return _pv_rubin_group_compare(tmp, k=int(k))
 
 
+# =========================================================
+# Task 15.3 — Chi-square contingency tables
+#   (TRUE_LABEL vs Strata) and (TRUE_LABEL vs Fit class)
+# plus: RUMM Item–Trait chi-square (Fixed 4 strata) tables only
+# =========================================================
+def _chisq_from_crosstab(ct_df):
+    """Pearson chi-square for a contingency table, with p via _chi2_sf()."""
+    import numpy as _np
+    import pandas as _pd
+    if ct_df is None or not isinstance(ct_df, _pd.DataFrame) or ct_df.size == 0:
+        return float('nan'), 0, float('nan')
+    O = _np.asarray(ct_df.values, dtype=float)
+    if O.ndim != 2 or O.shape[0] < 2 or O.shape[1] < 2:
+        return float('nan'), 0, float('nan')
+    rs = O.sum(axis=1, keepdims=True)
+    cs = O.sum(axis=0, keepdims=True)
+    tot = float(O.sum())
+    if tot <= 0:
+        return float('nan'), 0, float('nan')
+    E = (rs @ cs) / tot
+    with _np.errstate(divide='ignore', invalid='ignore'):
+        chi = _np.nansum((O - E) ** 2 / _np.where(E > 0, E, _np.nan))
+    df = int((O.shape[0] - 1) * (O.shape[1] - 1))
+    p = _chi2_sf(float(chi), int(df)) if df > 0 and _np.isfinite(chi) else float('nan')
+    return float(chi), int(df), float(p)
+
+
+def _task15_3_html(res, fit_class_all) -> str:
+    """Return HTML block for Task 15.3.
+
+    Produces:
+      - Table 15.3.1: Person count contingency TRUE_LABEL × Strata (fixed 4 strata)
+      - Table 15.3.2: Person count contingency TRUE_LABEL × Class (person fit type)
+      - RUMM 1) Item–Trait chi-square (Fixed 4 strata): two tables (strata summary + item-level)
+    """
+    import numpy as _np
+    import pandas as _pd
+    import html as _html
+
+    pdf = getattr(res, 'person_df', None)
+    if not isinstance(pdf, _pd.DataFrame) or len(pdf) == 0:
+        return "<div class='note'>(Task 15.3 skipped: person_df unavailable)</div>"
+
+    # --- label column ---
+    label_col = None
+    for c in ['TRUE_LABEL', 'True_Label', 'true_label', 'Profile', 'profile', 'GROUP', 'Group', 'group', 'CLASS', 'Class', 'class']:
+        if c in pdf.columns:
+            label_col = c
+            break
+    if label_col is None:
+        return "<div class='note'>(Task 15.3 skipped: TRUE_LABEL/Profile column not found in person_df)</div>"
+
+    # --- fit class (person fit type) ---
+    fc = _np.asarray(fit_class_all, dtype=float).reshape(-1)
+    if fc.shape[0] != len(pdf):
+        return "<div class='note'>(Task 15.3 skipped: fit class length does not match #persons)</div>"
+    fc_int = _pd.to_numeric(_pd.Series(fc), errors='coerce').astype('Int64')
+    fc_lbl = fc_int.astype(str).replace({'<NA>': 'NA'})
+
+    # --- strata (fixed 4 strata) ---
+    theta = None
+    if hasattr(res, 'theta') and res.theta is not None:
+        try:
+            theta = _np.asarray(res.theta, dtype=float).reshape(-1)
+        except Exception:
+            theta = None
+    if theta is None or theta.shape[0] != len(pdf):
+        if 'MEASURE' in pdf.columns:
+            theta = _pd.to_numeric(pdf['MEASURE'], errors='coerce').to_numpy(dtype=float)
+        else:
+            theta = _np.zeros(len(pdf), dtype=float)
+    strata = _rumm_strata_labels_fixed(theta)
+    # keep only A-D; others go to E
+    strata = _pd.Series(strata).astype(str)
+    strata = strata.where(strata.isin(['A', 'B', 'C', 'D']), other='E')
+
+    # --- contingency tables ---
+    lab = pdf[label_col].astype(str)
+    ct1 = _pd.crosstab(lab, strata, dropna=False)
+    # enforce column order
+    for col in ['A', 'B', 'C', 'D', 'E']:
+        if col not in ct1.columns:
+            ct1[col] = 0
+    ct1 = ct1[['A', 'B', 'C', 'D', 'E']]
+
+    ct2 = _pd.crosstab(lab, fc_lbl, dropna=False)
+    # prefer class order 1,2,3 then others
+    pref = ['1', '2', '3', 'NA']
+    cols = [c for c in pref if c in ct2.columns] + [c for c in ct2.columns if c not in pref]
+    ct2 = ct2[cols]
+
+    chi1, df1, p1 = _chisq_from_crosstab(ct1.loc[:, ['A', 'B', 'C', 'D']] if all(x in ct1.columns for x in ['A','B','C','D']) else ct1)
+    chi2, df2, p2 = _chisq_from_crosstab(ct2)
+
+    out = []
+    out.append("<h3>Task 15.3 — Chi-square contingency tables (person counts)</h3>")
+    out.append("<div class='note'>Chi-square is computed on person-count contingency tables. TRUE_LABEL is taken from the first available column among: TRUE_LABEL, Profile, GROUP, Class.</div>")
+
+    out.append("<h4>Table 15.3.1 — TRUE_LABEL × Strata (Fixed 4 strata; A–D; E=others)</h4>")
+    out.append(_df_to_html(ct1.reset_index().rename(columns={'index': label_col}), max_rows=200))
+    out.append(f"<div class='small'><b>ChSQ</b>={chi1:.2f} &nbsp; <b>df</b>={df1} &nbsp; <b>prob</b>={('NA' if not _np.isfinite(p1) else (('0.000' if p1<0.001 else f'{p1:.3f}')))}</div>")
+
+    out.append("<h4>Table 15.3.2 — TRUE_LABEL × Class (Person fit type)</h4>")
+    out.append(_df_to_html(ct2.reset_index().rename(columns={'index': label_col}), max_rows=200))
+    out.append(f"<div class='small'><b>ChSQ</b>={chi2:.2f} &nbsp; <b>df</b>={df2} &nbsp; <b>prob</b>={('NA' if not _np.isfinite(p2) else (('0.000' if p2<0.001 else f'{p2:.3f}')))}</div>")
+
+    # --- RUMM Item–Trait chi-square tables (fixed 4 strata) ---
+    try:
+        out.append("<h3>RUMM 1) Item–Trait Chi-square (Fixed 4 strata)</h3>")
+        out.append("<div class='note'>Two tables are provided: (i) strata summary (All items) and (ii) item-level χ² (df=3) across 4 strata. This is a compact extraction of the RUMM block.</div>")
+        out.append(_rumm_item_trait_fixed4_html(res))
+    except Exception as _e:
+        out.append("<div class='note' style='color:#b00'>(RUMM Item–Trait table failed: " + _html.escape(repr(_e)) + ")</div>")
+
+    return "\n".join(out)
+
+
+def _rumm_item_trait_fixed4_html(res) -> str:
+    """Return ONLY the two Item–Trait chi-square tables (Fixed 4 strata): strata summary + item-level."""
+    import numpy as _np
+    import pandas as _pd
+    import html as _html
+
+    agg = _aggregate_fixed_strata(res, jitem=1)
+    if not agg:
+        return "<div class='note'>(RUMM Item–Trait skipped: required matrices not available)</div>"
+
+    # Table 1: strata summary (all items)
+    rows_all = agg.get('rows_all', [])
+    chi_all = float(agg.get('chi_all', float('nan')))
+    df_all = int(agg.get('df_all', 0) or 0)
+    p_all = float(agg.get('p_all', float('nan')))
+
+    df1 = _pd.DataFrame(rows_all, columns=['Strata', 'Sum', 'Count*L', 'Mean', 'Expected', 'Variance'])
+    html = []
+    html.append("<h4>Table R1 — Strata summary (All items)</h4>")
+    html.append(_df_to_html(df1, max_rows=20))
+    ptxt = 'NA' if (not _np.isfinite(p_all)) else ('0.000' if p_all < 0.001 else f"{p_all:.3f}")
+    html.append(f"<div class='small'><b>ChSQ</b>={chi_all:.2f} &nbsp; <b>df</b>={df_all} &nbsp; <b>prob</b>={ptxt}</div>")
+
+    # Table 2: item-level chi-square
+    X_obs, E, V = _safe_get_obs_exp_var(res)
+    if X_obs is None:
+        return "\n".join(html) + "<div class='note'>(Item-level table skipped: X/E/V missing)</div>"
+    theta = _np.asarray(getattr(res, 'theta', _np.zeros(X_obs.shape[0])), dtype=float)
+    if theta.ndim != 1 or theta.shape[0] != X_obs.shape[0]:
+        pdf = getattr(res, 'person_df', None)
+        if hasattr(pdf, 'columns') and 'MEASURE' in pdf.columns and len(pdf) == X_obs.shape[0]:
+            theta = _pd.to_numeric(pdf['MEASURE'], errors='coerce').to_numpy(dtype=float)
+        else:
+            theta = _np.zeros(X_obs.shape[0], dtype=float)
+    strata = _rumm_strata_labels_fixed(theta)
+    order = ['A', 'B', 'C', 'D']
+    I = int(X_obs.shape[1])
+
+    # item names and fit indices
+    idf = getattr(res, 'item_df', None)
+    item_names = [f"Item {j+1}" for j in range(I)]
+    infit = [float('nan')]*I
+    outfit = [float('nan')]*I
+    if isinstance(idf, _pd.DataFrame) and len(idf) >= I:
+        name_col = None
+        for c in ['ITEM','Item','NAME','Label']:
+            if c in idf.columns:
+                name_col = c
+                break
+        if name_col:
+            item_names = [str(x) for x in idf[name_col].tolist()[:I]]
+        for c in ['INFIT_MNSQ','INFIT','Infit_MNSQ','INFIT_MeanSquare']:
+            if c in idf.columns:
+                infit = _pd.to_numeric(idf[c], errors='coerce').to_numpy(dtype=float)[:I].tolist()
+                break
+        for c in ['OUTFIT_MNSQ','OUTFIT','Outfit_MNSQ','OUTFIT_MeanSquare']:
+            if c in idf.columns:
+                outfit = _pd.to_numeric(idf[c], errors='coerce').to_numpy(dtype=float)[:I].tolist()
+                break
+
+    rows = []
+    for j in range(I):
+        chi = 0.0
+        ok = True
+        for s in order:
+            m = (strata == s)
+            if not _np.any(m):
+                continue
+            Oj = float(_np.nansum(X_obs[m, j]))
+            Ej = float(_np.nansum(E[m, j]))
+            Vj = float(_np.nansum(V[m, j]))
+            if not _np.isfinite(Vj) or Vj <= 0:
+                ok = False
+                continue
+            chi += float(((Oj - Ej) ** 2) / Vj)
+        if not ok:
+            p = float('nan')
+        else:
+            p = _chi2_sf(float(chi), 3)
+        ptxt = 'NA' if (not _np.isfinite(p)) else ('0.000' if p < 0.001 else f"{p:.3f}")
+        rows.append({
+            'ItemNo': j+1,
+            'Item': item_names[j],
+            'ChSQ': chi,
+            'df': 3,
+            'prob.': ptxt,
+            'INFIT_MNSQ': ("NA" if not _np.isfinite(float(infit[j])) else f"{float(infit[j]):.2f}"),
+            'OUTFIT_MNSQ': ("NA" if not _np.isfinite(float(outfit[j])) else f"{float(outfit[j]):.2f}"),
+        })
+
+    df2 = _pd.DataFrame(rows)
+    html.append("<h4>Table R2 — Item-level χ² (df=3 across 4 strata)</h4>")
+    html.append(_df_to_html(df2, max_rows=200))
+    return "\n".join(html)
+
+
 
 
 def _q3_abs_from_zstd(Z, mode: str = "items"):
@@ -4189,29 +4421,62 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
 
         if go is not None and _plotly_plot is not None:
             import numpy as _np
+            import pandas as _pd
+            import numpy as _np
+            import pandas as _pd
             it = getattr(res, "item_df", None)
             if it is not None and len(it) > 0 and "OUTFIT_MNSQ" in it.columns and "MEASURE" in it.columns:
                 i3 = it.copy()
                 fit_cut = 2.0
                 x = _np.asarray(i3["OUTFIT_MNSQ"], dtype=float)
-                y = _np.asarray(i3["MEASURE"], dtype=float)  # delta/logit
-                se = _np.asarray(i3["SE"], dtype=float) if "SE" in i3.columns else _np.full(len(i3), _np.nan)
-                # size from SE
-                def _size_from_se(se, smin=6.0, smax=28.0):
-                    se = _np.asarray(se, dtype=float)
-                    out = _np.full_like(se, smin, dtype=float)
-                    m = _np.isfinite(se)
-                    if not m.any():
-                        return out
-                    q1 = _np.nanquantile(se[m], 0.10)
-                    q9 = _np.nanquantile(se[m], 0.90)
-                    if not _np.isfinite(q1) or not _np.isfinite(q9) or q9 <= q1:
-                        out[m] = (smin+smax)/2.0
-                        return out
-                    se2 = _np.clip(se, q1, q9)
-                    out[m] = smin + (se2[m]-q1)/(q9-q1) * (smax-smin)
-                    return out
-                msize = _size_from_se(se)
+                # y-axis: PTMA (point-measure correlation). Prefer item_df PTMA; otherwise compute proxy.
+                _ptma = None
+                if "PTMA" in i3.columns:
+                    _ptma = _np.asarray(_pd.to_numeric(i3["PTMA"], errors="coerce"), dtype=float)
+                if _ptma is None or (not _np.isfinite(_ptma).any()):
+                    try:
+                        dbg = getattr(res, "debug", {}) if hasattr(res, "debug") else {}
+                        _X = None
+                        for _k in ("X", "X0", "X_mapped", "data"):
+                            if isinstance(dbg, dict) and _k in dbg:
+                                try:
+                                    _X = _np.asarray(dbg.get(_k), dtype=float)
+                                    break
+                                except Exception:
+                                    _X = None
+                        if _X is None:
+                            try:
+                                _X = _np.asarray(getattr(res, "data", None), dtype=float)
+                            except Exception:
+                                _X = None
+                        _th = _np.asarray(getattr(res, "theta", None), dtype=float)
+                        if _X is not None and getattr(_X, "ndim", 0) == 2 and _th is not None and _th.ndim == 1:
+                            if _X.shape[0] != _th.shape[0] and _X.shape[1] == _th.shape[0]:
+                                _X = _X.T
+                            if _X.shape[0] == _th.shape[0] and _X.shape[1] == len(i3):
+                                _pt = compute_ptma_from_matrices(_X, _th, item_names=(i3["ITEM"].astype(str).tolist() if "ITEM" in i3.columns else None), min_n=5)
+                                if len(_pt) == len(i3):
+                                    _ptma = _np.asarray(_pd.to_numeric(_pt["PTMA"], errors="coerce"), dtype=float)
+                    except Exception:
+                        pass
+                if _ptma is None:
+                    _ptma = _np.full(len(i3), _np.nan)
+
+                y = _ptma
+                # bubble size: item delta (difficulty). Use |delta| so larger magnitude -> larger bubble.
+                delta = _np.asarray(_pd.to_numeric(i3["MEASURE"], errors="coerce"), dtype=float)
+                d = _np.abs(delta)
+                if not _np.isfinite(d).any():
+                    msize = _np.full(len(i3), 18.0)
+                else:
+                    d1 = _np.nanquantile(d[_np.isfinite(d)], 0.10)
+                    d9 = _np.nanquantile(d[_np.isfinite(d)], 0.90)
+                    if (not _np.isfinite(d1)) or (not _np.isfinite(d9)) or d9 <= d1:
+                        msize = _np.full(len(i3), 22.0)
+                    else:
+                        dd = _np.clip(d, d1, d9)
+                        msize = 8.0 + (dd - d1) / (d9 - d1) * (34.0 - 8.0)
+
                 good = _np.asarray(x <= fit_cut)
                 bad = _np.asarray(x > fit_cut)
 
@@ -4222,10 +4487,10 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                         mode="markers",
                         marker=dict(size=msize[good], opacity=0.85, color="blue"),
                         name=f"OUTFIT ≤ {fit_cut}",
-                        hovertemplate="ITEM: %{customdata[0]}<br>Delta: %{y:.3f}<br>SE: %{customdata[1]:.3f}<br>OUTFIT: %{customdata[2]:.3f}<br>INFIT: %{customdata[3]:.3f}<extra></extra>",
+                        hovertemplate="ITEM: %{customdata[0]}<br>PTMA: %{y:.3f}<br>Delta: %{customdata[1]:.3f}<br>OUTFIT: %{customdata[2]:.3f}<br>INFIT: %{customdata[3]:.3f}<extra></extra>",
                         customdata=_np.stack([
                             i3.loc[good, "ITEM"].astype(str).to_numpy() if "ITEM" in i3.columns else _np.arange(len(i3))[good].astype(str),
-                            se[good],
+                            delta[good],
                             x[good],
                             _np.asarray(i3["INFIT_MNSQ"], dtype=float)[good] if "INFIT_MNSQ" in i3.columns else _np.full(good.sum(), _np.nan),
                         ], axis=1)
@@ -4236,24 +4501,31 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                         mode="markers",
                         marker=dict(size=msize[bad], opacity=0.95, color="red"),
                         name=f"OUTFIT > {fit_cut}",
-                        hovertemplate="ITEM: %{customdata[0]}<br>Delta: %{y:.3f}<br>SE: %{customdata[1]:.3f}<br>OUTFIT: %{customdata[2]:.3f}<br>INFIT: %{customdata[3]:.3f}<extra></extra>",
+                        hovertemplate="ITEM: %{customdata[0]}<br>PTMA: %{y:.3f}<br>Delta: %{customdata[1]:.3f}<br>OUTFIT: %{customdata[2]:.3f}<br>INFIT: %{customdata[3]:.3f}<extra></extra>",
                         customdata=_np.stack([
                             i3.loc[bad, "ITEM"].astype(str).to_numpy() if "ITEM" in i3.columns else _np.arange(len(i3))[bad].astype(str),
-                            se[bad],
+                            delta[bad],
                             x[bad],
                             _np.asarray(i3["INFIT_MNSQ"], dtype=float)[bad] if "INFIT_MNSQ" in i3.columns else _np.full(bad.sum(), _np.nan),
                         ], axis=1)
                     ))
 
-                fig3.add_shape(type="line", x0=fit_cut, x1=fit_cut, y0=-10, y1=10,
+                fig3.add_shape(type="line", x0=fit_cut, x1=fit_cut, y0=-1.0, y1=1.0,
                                line=dict(color="red", width=2, dash="dot"))
+                # PTMA criterion line
+                try:
+                    fig3.add_shape(type="line", x0=float(_np.nanmin(x))-1.0, x1=float(_np.nanmax(x))+1.0,
+                                   y0=0.3, y1=0.3,
+                                   line=dict(color="red", width=2, dash="dot"))
+                except Exception:
+                    pass
                 fig3.update_layout(
                     height=520,
                     margin=dict(l=35, r=15, t=60, b=45),
-                    title="KIDMAP (Figure 3) — Item OUTFIT MNSQ vs Delta"
+                    title="Item-Outfit plot (Figure 3) — Item OUTFIT MNSQ vs PTMA"
                 )
                 fig3.update_xaxes(title_text="OUTFIT MNSQ")
-                fig3.update_yaxes(title_text="Delta (logit)")
+                fig3.update_yaxes(title_text="PTMA", range=[-1.0, 1.0])
 
                 kidmap_html = _plotly_plot(fig3, include_plotlyjs="cdn", output_type="div")
     except Exception as _e:
@@ -4261,7 +4533,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
 
     if kidmap_html:
         html_parts.append("<h2>Item-Outfit plot (Figure 3)</h2>")
-        html_parts.append("<p class='note'>Item-outfit plot shows item OUTFIT MNSQ vs item difficulty (delta). Red points exceed the fit cut.</p>")
+        html_parts.append("<p class='note'>Figure 3 uses PTMA (y-axis) and item delta as bubble size. The red dotted horizontal line marks PTMA = 0.30 (criterion). Red points exceed the outfit fit-cut.</p>")
         html_parts.append(kidmap_html)
 
 
@@ -4306,24 +4578,41 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                 fit_cut_p = 2.0
                 x = _np.asarray(df4["OUTFIT_MNSQ"], dtype=float)
                 y = _np.asarray(df4["MEASURE"], dtype=float)
-                se = _np.asarray(df4["SE"], dtype=float) if "SE" in df4.columns else _np.full(len(df4), _np.nan)
+                # bubble size: person PTMA (proxy). Prefer person_df PTMA; otherwise compute proxy.
+                ptma_p = None
+                try:
+                    if "PTMA" in df4.columns:
+                        ptma_p = _np.asarray(_pd.to_numeric(df4["PTMA"], errors="coerce"), dtype=float)
+                except Exception:
+                    ptma_p = None
+                if ptma_p is None or (not _np.isfinite(ptma_p).any()):
+                    try:
+                        ptma_p = _person_ptma_proxy(res)
+                    except Exception:
+                        ptma_p = None
+                if ptma_p is None:
+                    ptma_p = _np.full(len(df4), _np.nan)
 
-                def _size_from_se(se, smin=6.0, smax=28.0):
-                    se = _np.asarray(se, dtype=float)
-                    out = _np.full_like(se, smin, dtype=float)
-                    m = _np.isfinite(se)
-                    if not m.any():
-                        return out
-                    q1 = _np.nanquantile(se[m], 0.10)
-                    q9 = _np.nanquantile(se[m], 0.90)
-                    if not _np.isfinite(q1) or not _np.isfinite(q9) or q9 <= q1:
-                        out[m] = (smin+smax)/2.0
-                        return out
-                    se2 = _np.clip(se, q1, q9)
-                    out[m] = smin + (se2[m]-q1)/(q9-q1) * (smax-smin)
-                    return out
+                ap = _np.abs(_np.asarray(ptma_p, dtype=float))
+                if not _np.isfinite(ap).any():
+                    msize = _np.full(len(df4), 18.0)
+                else:
+                    p1 = _np.nanquantile(ap[_np.isfinite(ap)], 0.10)
+                    p9 = _np.nanquantile(ap[_np.isfinite(ap)], 0.90)
+                    if (not _np.isfinite(p1)) or (not _np.isfinite(p9)) or p9 <= p1:
+                        msize = _np.full(len(df4), 22.0)
+                    else:
+                        ap2 = _np.clip(ap, p1, p9)
+                        msize = 8.0 + (ap2 - p1) / (p9 - p1) * (34.0 - 8.0)
 
-                msize = _size_from_se(se)
+
+                # Plotly marker.size cannot contain NaN/inf; replace with minimum size
+                msize = _np.asarray(msize, dtype=float)
+                msize[~_np.isfinite(msize)] = 8.0
+                # Plotly marker.size cannot contain NaN/Inf; fall back to minimum size.
+                msize = _np.asarray(msize, dtype=float)
+                msize[~_np.isfinite(msize)] = 8.0
+
                 good = _np.asarray(x <= fit_cut_p)
                 bad = _np.asarray(x > fit_cut_p)
 
@@ -4355,16 +4644,16 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                     x=x[good], y=y[good], mode="markers",
                     marker=dict(size=msize[good], opacity=0.75),
                     name="<= 2.0",
-                    text=[f"KID={_html.escape(str(k))}<br>SE={float(s):.2f}<br>Measure={float(mm):.2f}<br>Outfit={float(of):.2f}"
-                          for k, s, mm, of in zip(df4.loc[good, "KID"], se[good], y[good], x[good])]
+                    text=[f"KID={_html.escape(str(k))}<br>PTMA={float(p):.3f}<br>Measure={float(mm):.2f}<br>Outfit={float(of):.2f}"
+                          for k, p, mm, of in zip(df4.loc[good, "KID"], _np.asarray(ptma_p, dtype=float)[good], y[good], x[good])]
                 ))
                 if bad.any():
                     fig4.add_trace(go.Scatter(
                         x=x[bad], y=y[bad], mode="markers",
                         marker=dict(size=msize[bad], opacity=0.85, symbol="diamond"),
                         name="> 2.0",
-                        text=[f"KID={_html.escape(str(k))}<br>SE={float(s):.2f}<br>Measure={float(mm):.2f}<br>Outfit={float(of):.2f}"
-                              for k, s, mm, of in zip(df4.loc[bad, "KID"], se[bad], y[bad], x[bad])]
+                        text=[f"KID={_html.escape(str(k))}<br>PTMA={float(p):.3f}<br>Measure={float(mm):.2f}<br>Outfit={float(of):.2f}"
+                              for k, p, mm, of in zip(df4.loc[bad, "KID"], _np.asarray(ptma_p, dtype=float)[bad], y[bad], x[bad])]
                     ))
                 fig4.add_vline(x=fit_cut_p, line_dash="dot")
                 # Strata cut lines (theta cutpoints)
@@ -4381,6 +4670,7 @@ def render_report_html(res: RaschResult, run_id: str, kid_no: int = 1, item_no: 
                     height=520,
                 )
                 html_parts.append("<h2>Person-Outfit plot (Figure 4)</h2>")
+                html_parts.append("<p class='note'>Figure 4 uses person PTMA as bubble size (|PTMA|). PTMA is also shown in hover text.</p>")
                 html_parts.append(_plotly_plot(fig4, include_plotlyjs=False, output_type="div"))
 
                 
@@ -6059,6 +6349,15 @@ This is why <b>PTMA alone is not enough</b>, but it’s a <b>necessary witness</
                                         if t152 is not None and hasattr(t152, 'empty') and not t152.empty:
                                             html_parts.append("<h4>Contrasts vs Fit class 1 (reference)</h4>")
                                             html_parts.append(_df_to_html(t152, max_rows=100))
+
+                                        # -------------------------------------------------
+                                        # Task 15.3: TRUE_LABEL vs (Strata, Fit class) chi-square tables
+                                        # and RUMM Item–Trait chi-square tables (Fixed 4 strata)
+                                        # -------------------------------------------------
+                                        try:
+                                            html_parts.append(_task15_3_html(res, fit_cls15))
+                                        except Exception as _e153:
+                                            html_parts.append("<div class='note' style='color:#b00'>(Task 15.3 failed: " + _html.escape(repr(_e153)) + ")</div>")
                                 except Exception as _e15pv:
                                     html_parts.append("<div class='note' style='color:#b00'>(Task 15 PV failed: " + _html.escape(repr(_e15pv)) + ")</div>")
 
